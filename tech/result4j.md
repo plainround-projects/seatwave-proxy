@@ -109,20 +109,24 @@ The last three lines: `equals` compares by content (a parsed 7 equals `Result.su
     int plainPort = reader.intBetween("http.plainPort", 0, HIGHEST_PORT);
     int tlsPort = reader.intBetween("http.tlsPort", 0, HIGHEST_PORT);
     int adminPort = reader.intBetween("http.adminPort", 0, HIGHEST_PORT);
-    String keystore = reader.textMatching("tls.keystore", FILE);
-    String passwordFile = reader.textMatching("tls.passwordFile", FILE);
+    String keystore = reader.filePath("tls.keystore");
+    String passwordFile = reader.filePath("tls.passwordFile");
     int backlog = reader.intBetween("http.backlog", 1, MAX_BACKLOG);
     int workers = reader.intBetween("http.workerThreads", 1, MAX_WORKERS);
     int queue = reader.intBetween("http.queueCapacity", 1, MAX_QUEUE);
     List<String> trusted = reader.listMatching("forwarded.trustedProxies", ADDRESS);
     Duration longPoll = reader.millisBetween("feed.longPollHoldMillis", 1, MAX_WAIT_MILLIS);
+    int problemsBeforeStream = reader.problems().size();
     Duration heartbeat = reader.millisBetween("feed.heartbeatMillis", 1, MAX_WAIT_MILLIS);
     Duration lifetime = reader.millisBetween("feed.streamLifetimeMillis", 1, MAX_WAIT_MILLIS);
+    // The rule between the two keys is checked only when both were read, so a missing key gives
+    // one problem line, not a second one about the stand-in values.
+    boolean streamKeysValid = reader.problems().size() == problemsBeforeStream;
     if (sharePort(plainPort, tlsPort, adminPort)) {
       reader.addProblem(
           "http.plainPort, http.tlsPort and http.adminPort must differ (0 means any free port)");
     }
-    if (lifetime.compareTo(heartbeat) <= 0) {
+    if (streamKeysValid && lifetime.compareTo(heartbeat) <= 0) {
       reader.addProblem(
           "feed.streamLifetimeMillis must be longer than feed.heartbeatMillis, or a stream ends"
               + " before its first heartbeat");
@@ -144,7 +148,7 @@ The last three lines: `equals` compares by content (a parsed 7 equals `Result.su
         new BackendSettings(
 ```
 
-The method reads about fifteen keys. Each `reader.xxx(...)` call records a problem in the reader if the key is missing or out of range, and returns a harmless stand-in value. Nothing is thrown. Two cross-checks add their own problem lines (the three ports must differ; the stream must outlive its heartbeat). The `trusted` list goes through `TrustedProxies.parse`, which returns a `Result` itself, and its error is added as one more problem. The last `if` is the hinge: if the reader holds any problem, `Result.error(reader.problems())` returns all of them in one list, before any record is built from stand-in values. Otherwise `Result.success(new BackendSettings(...))` returns the checked record. That is why the program can print every problem in one run (`java-properties.md`).
+The method reads about fifteen keys. Each `reader.xxx(...)` call records a problem in the reader if the key is missing or out of range, and returns a harmless stand-in value. Nothing is thrown. Two cross-checks add their own problem lines (the three ports must differ; the stream must outlive its heartbeat). The second is checked only when both stream keys were read: `problemsBeforeStream` counts the problems before the two reads, and `streamKeysValid` is true only if the count did not grow. Without that, two missing keys would both be stood in by 1 ms, and the rule "lifetime must be longer than heartbeat" would add a third, false line about values nobody wrote. The `trusted` list goes through `TrustedProxies.parse`, which returns a `Result` itself, and its error is added as one more problem. The last `if` is the hinge: if the reader holds any problem, `Result.error(reader.problems())` returns all of them in one list, before any record is built from stand-in values. Otherwise `Result.success(new BackendSettings(...))` returns the checked record. That is why the program can print every problem in one run (`java-properties.md`).
 
 ### Building a result from one reason: `TrustedProxies.parse`
 
@@ -153,12 +157,13 @@ The method reads about fifteen keys. Each `reader.xxx(...)` call records a probl
     Objects.requireNonNull(literals, "literals");
     Set<InetAddress> parsed = new LinkedHashSet<>();
     for (String literal : literals) {
-      try {
-        // ofLiteral never consults DNS: a name here is refused, not resolved.
-        parsed.add(InetAddress.ofLiteral(literal));
-      } catch (IllegalArgumentException notAnAddress) {
+      // The same strict rule as the forwarded hops: never a name, never DNS, and no short IPv4
+      // form that would trust another address than the one written.
+      Optional<InetAddress> address = ClientAddress.literal(literal);
+      if (address.isEmpty()) {
         return Result.error("a trusted proxy must be an IP address, but was '" + literal + "'");
       }
+      parsed.add(address.get());
     }
     if (parsed.isEmpty()) {
       return Result.error("at least one trusted proxy address is needed");
@@ -167,7 +172,7 @@ The method reads about fifteen keys. Each `reader.xxx(...)` call records a probl
   }
 ```
 
-This method stops at the first wrong literal, because it has a single `String` for a reason. `InetAddress.ofLiteral` accepts only an IP address and never asks DNS (the comment says "a name here is refused, not resolved"). Three exits: a wrong literal returns `Result.error` with the text that names it; an empty list returns `Result.error("at least one trusted proxy address is needed")`; everything else returns `Result.success`.
+This method stops at the first wrong literal, because it has a single `String` for a reason. `ClientAddress.literal` returns an `Optional`: an address, or empty for text that is not one. It never asks DNS, and it refuses the short IPv4 forms (`127.0.1` for `127.0.0.1`) that `InetAddress.ofLiteral` alone would accept, so a typo in the list cannot trust another address than the one written (`java-forwarded-walkthrough.md`). Three exits: a wrong literal returns `Result.error` with the text that names it; an empty list returns `Result.error("at least one trusted proxy address is needed")`; everything else returns `Result.success`.
 
 ### Building a result from the query string: `parameters`
 
@@ -216,12 +221,17 @@ The result type here is `Result<Map<String, String>, String>`. An empty query is
               holdSeat(request, parsed);
           case Result.Error<HoldRequestBody, JsonCodec.BindingProblem>(
                   JsonCodec.BindingProblem problem) ->
-              invalid(request, List.of(problem.pointer() + " " + problem.detail()));
+              invalid(
+                  request,
+                  List.of(
+                      problem.pointer().isEmpty()
+                          ? problem.detail()
+                          : problem.pointer() + " " + problem.detail()));
         };
     // Final outcomes are stored, so a retry with the same key gets the same answer (Module 7).
 ```
 
-- Here the `switch` is an **expression**: it produces the value of `reply`. Each case unpacks the record: `Result.Success<HoldRequestBody, JsonCodec.BindingProblem>(HoldRequestBody parsed)` binds the good value, and `Result.Error<...>(JsonCodec.BindingProblem problem)` binds the problem. A success books the seat. An error becomes an invalid-request answer that joins the field's JSON pointer and the detail. The compiler checks that both cases are present. If a later version of the library added a third case, this `switch` would stop compiling, and the author would have to handle it.
+- Here the `switch` is an **expression**: it produces the value of `reply`. Each case unpacks the record: `Result.Success<HoldRequestBody, JsonCodec.BindingProblem>(HoldRequestBody parsed)` binds the good value, and `Result.Error<...>(JsonCodec.BindingProblem problem)` binds the problem. A success books the seat. An error becomes an invalid-request answer that joins the field's JSON pointer and the detail, such as `/eventId has the wrong type`. When the whole body is at fault the pointer is empty, and the `? :` (the conditional operator: the value after `?` if the test is true, after `:` if not) uses the detail alone, so the text does not start with a space. The compiler checks that both cases are present. If a later version of the library added a third case, this `switch` would stop compiling, and the author would have to handle it.
 
 ### A result with many error exits: `JsonCodec.read`
 
@@ -241,11 +251,9 @@ The result type here is `Result<Map<String, String>, String>`. An empty query is
         return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
       }
       T value = mapper.readValue(parser, type);
-      if (parser.nextToken() != null) {
-        return Result.error(
-            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
-      }
-      return Result.success(value);
+      return hasMore(parser)
+          ? Result.error(new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"))
+          : Result.success(value);
     } catch (UnrecognizedPropertyException unknownField) {
       return Result.error(
           new BindingProblem(
@@ -259,6 +267,14 @@ The result type here is `Result<Map<String, String>, String>`. An empty query is
             new BindingProblem(pointerOf(unbound), "is out of range for this field"));
       }
       return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (StreamReadException malformed) {
+      if (malformed.getOriginalMessage().startsWith(DUPLICATE_MESSAGE)
+          && malformed.getProcessor() != null) {
+        // The parser stopped on the repeated name, so its context is the path of that field.
+        String pointer = malformed.getProcessor().getParsingContext().pathAsPointer().toString();
+        return Result.error(new BindingProblem(pointer, "appears more than once"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
       return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (IOException notReadable) {
@@ -268,7 +284,7 @@ The result type here is `Result<Map<String, String>, String>`. An empty query is
   }
 ```
 
-`read` has one success line, `return Result.success(value);`, and eight error exits, each with a `BindingProblem` that says which field and what is wrong: an empty body, a body that is not an object, data after the object, an unknown field, a wrong type, a number out of range and two kinds of malformed JSON. Only a failure that cannot be the client's fault (`IOException` while reading a `String`) is thrown, as an `UncheckedIOException`. This is the line the repository draws between a `Result` and an exception (`jackson.md` explains the Jackson side).
+`read` has one success line, `: Result.success(value);`, and ten error exits, each with a `BindingProblem` that says which field and what is wrong: an empty body, a body that is not an object, data after the object, an unknown field, a wrong type, a number out of range, a field that appears twice and three kinds of malformed JSON. Only a failure that cannot be the client's fault (`IOException` while reading a `String`) is thrown, as an `UncheckedIOException`. This is the line the repository draws between a `Result` and an exception (`jackson.md` explains the Jackson side).
 
 ### How the tests use a result
 

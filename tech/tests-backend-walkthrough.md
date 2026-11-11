@@ -18,20 +18,21 @@ A **test** is a small program that calls the code and checks the result. A test 
 
 ## Why this repository uses it
 
-The README states 119 tests and a line-coverage floor of 80 percent. These tests start the real server on ports the system picks, so they run without Docker. The tests that need the real proxy are in a separate task. Because SeatWave is the thing the whole module measures, every route, error shape and cache header is pinned down here.
+The whole suite of version 1.0.1 has 166 tests and a line-coverage floor of 80 percent; 52 of them are in this package. These tests start the real server on ports the system picks, so they run without Docker. The tests that need the real proxy are in a separate task. Because SeatWave is the thing the whole module measures, every route, error shape and cache header is pinned down here.
 
 ## Where it appears
 
 | File | Tests | What it covers |
 |---|---|---|
 | `backend/TestBackend.java` | none (helper) | Starts and closes a backend; builds URIs and a client. |
-| `backend/BackendServerTest.java` | 20 | Routes, errors, headers, paging, holds, static files, long poll, stream, TLS, metrics, queue limit. |
+| `backend/BackendServerTest.java` | 23 | Routes, errors, headers, paging, holds, static files, long poll, stream, TLS, metrics, queue limit, `HEAD`, unknown paths, the JSON media type. |
 | `backend/ForwardedInvariantTest.java` | 4 | Forged and trusted forwarding headers over HTTP, and the request id. |
-| `backend/HoldKeysTest.java` | 3 | Claim, replay, reuse, full table. |
-| `backend/HoldLedgerTest.java` | 2 | One winner among 100 racers; expiry. |
+| `backend/HoldKeysTest.java` | 4 | Claim, replay, reuse, full table, 100 racing claims. |
+| `backend/HoldLedgerTest.java` | 3 | One winner among 100 racers; expiry; an expired hold forgotten when its seat is held again. |
 | `backend/SeatCatalogTest.java` | 4 | Seat labels, cursors, last page, version 0 text. |
-| `backend/BackendSettingsTest.java` | 3 | The real container settings; all problems together; direct construction. |
-| `backend/BackendCliTest.java` | 4 | Usage text, invalid file, missing TLS file, a valid start. |
+| `backend/BackendSettingsTest.java` | 5 | The real container settings; all problems together; missing stream keys; a short IPv4 form; direct construction. |
+| `backend/BackendCliTest.java` | 5 | Usage text, invalid file, a broken escape, missing TLS file, a valid start. |
+| `backend/SeatWaveRoutesTest.java` | 4 | The routes called directly: a key still running, a full key table, an interrupted long poll, a whole-body problem. |
 
 ## How it works underneath
 
@@ -376,13 +377,17 @@ The imports bring in AssertJ's `assertThat` and Awaitility's `await` as **static
     HttpResponse<String> last =
         backend.get(backend.plain("/v1/events/1/seats?limit=2&cursor=czEuVC0xMDAw"));
 
-    assertThat(first.body()).contains("A-1", "A-2", "A-3", "nextCursor");
+    // Each label with its closing quote, so "A-1" cannot be matched by "A-10".
+    assertThat(first.body())
+        .contains("\"seat\":\"A-1\"", "\"seat\":\"A-2\"", "\"seat\":\"A-3\"", "nextCursor")
+        .doesNotContain("\"seat\":\"A-4\"");
+    assertThat(first.body().split("\"seat\":", -1)).hasSize(4);
     assertThat(next.body()).contains("\"seat\":\"B-1\"", "\"seat\":\"B-2\"");
     assertThat(last.body()).isEqualTo("{\"items\":[]}");
   }
 ```
 
-**Paging across sections.** With no `section`, a limit of 3 returns `A-1`, `A-2`, `A-3` and a cursor (the checks use `contains`, which also matches `A-10`, so they are looser than they look). The hard-coded cursor `czEuQS0xMDAw` is Base64 for `s1.A-1000`, the last seat of section A, so the next page must start at `B-1` and `B-2`. The cursor `czEuVC0xMDAw` is `s1.T-1000`, the very last seat; the page after it is exactly `{"items":[]}`: no items and no cursor.
+**Paging across sections.** With no `section`, a limit of 3 returns `A-1`, `A-2`, `A-3` and a cursor. The checks look for each label with its quotes, `"seat":"A-1"`, because the bare text `A-1` would also be found inside `A-10`; the comment says so. `doesNotContain("\"seat\":\"A-4\"")` proves the page stops after three, and `split("\"seat\":", -1)` cuts the body at each seat field: three seats give four pieces, so `hasSize(4)` counts the seats exactly. (The first version checked `contains("A-1", "A-2", "A-3")`, which `A-10` to `A-39` would also have passed.) The hard-coded cursor `czEuQS0xMDAw` is Base64 for `s1.A-1000`, the last seat of section A, so the next page must start at `B-1` and `B-2`. The cursor `czEuVC0xMDAw` is `s1.T-1000`, the very last seat; the page after it is exactly `{"items":[]}`: no items and no cursor.
 
 ```java
   @Test
@@ -547,11 +552,59 @@ The imports bring in AssertJ's `assertThat` and Awaitility's `await` as **static
 
     assertThat(putHold.statusCode()).isEqualTo(405);
     assertThat(putHold.headers().firstValue("allow")).hasValue("POST");
-    assertThat(postEvents.headers().firstValue("allow")).hasValue("GET");
+    assertThat(postEvents.statusCode()).isEqualTo(405);
+    assertThat(postEvents.headers().firstValue("allow")).hasValue("GET, HEAD");
+  }
+
+  @Test
+  void answersAnUnknownPathWithNotFoundWhateverTheMethod() {
+    HttpResponse<String> postNothing =
+        backend.send(post("/nothing", "application/json", "{}").build());
+
+    assertThat(postNothing.statusCode()).isEqualTo(404);
+    assertThat(postNothing.headers().firstValue("allow")).isEmpty();
+  }
+
+  @Test
+  void answersHeadWithTheHeadersOfGetAndNoBody() {
+    HttpResponse<String> head =
+        backend.send(
+            HttpRequest.newBuilder(backend.plain("/events/1/seats?section=A"))
+                .timeout(TIMEOUT)
+                .HEAD()
+                .build());
+
+    assertThat(head.statusCode()).isEqualTo(200);
+    assertThat(head.body()).isEmpty();
+    assertThat(head.headers().firstValue("content-length")).hasValue("36894");
+    assertThat(head.headers().firstValue("cache-control")).hasValue("no-cache");
+  }
+
+  @Test
+  void acceptsOnlyTheJsonMediaTypeWithOrWithoutParameters() {
+    HttpResponse<String> lookalike =
+        backend.send(
+            post("/v1/holds", "application/jsonx", body("E-1", "fan-1"))
+                .header("Idempotency-Key", "\"key-9\"")
+                .build());
+    HttpResponse<String> withCharset =
+        backend.send(
+            post("/v1/holds", "Application/JSON; charset=utf-8", body("E-2", "fan-1"))
+                .header("Idempotency-Key", "\"key-10\"")
+                .build());
+
+    assertThat(lookalike.statusCode()).isEqualTo(415);
+    assertThat(withCharset.statusCode()).isEqualTo(201);
   }
 ```
 
-**Other methods.** A `PUT` to `/v1/holds` gives 405 with `Allow: POST`; a `POST` to `/v1/events` gives 405 with `Allow: GET`.
+**Other methods.** A `PUT` to `/v1/holds` gives 405 with `Allow: POST`; a `POST` to `/v1/events` gives 405 with `Allow: GET, HEAD`, the two methods that path takes.
+
+**Unknown paths.** A `POST` to `/nothing` gives 404, and no `Allow` header (`isEmpty()` on the `Optional`): there is no resource whose methods could be listed. The first version answered 405 with `Allow: GET`.
+
+**HEAD.** `HttpRequest.newBuilder(...).HEAD()` builds a `HEAD` request for the version 0 seat map. The answer must be 200 with an empty body, the same `content-length` the `GET` sends (36,894) and the same `cache-control`. That is the meaning RFC 9110 gives `HEAD`: the headers of a `GET`, without the body.
+
+**The JSON media type.** `application/jsonx` begins with `application/json` but is another media type, so it must get 415. `Application/JSON; charset=utf-8` is JSON with a parameter and in other letter case, so it must be accepted (201). The two seats, `E-1` and `E-2`, and the two keys differ from those of every other test, so the holds cannot collide.
 
 ```java
   @Test
@@ -637,6 +690,16 @@ The imports bring in AssertJ's `assertThat` and Awaitility's `await` as **static
     backend.get(backend.plain("/health"));
     backend.get(backend.plain("/nothing"));
 
+    // A request is counted when its worker finishes, which can be just after the client has read
+    // the whole answer, so the test waits for the count instead of reading it once.
+    await()
+        .atMost(TIMEOUT)
+        .until(() -> {
+          String text = backend.metrics();
+          return text.contains("route=\"other\",status=\"404\"} 1")
+              && text.contains("route=\"GET /health\",status=\"200\"} 1")
+              && text.contains("seatwave_workers_busy 0");
+        });
     String metrics = backend.metrics();
 
     assertThat(metrics)
@@ -649,7 +712,7 @@ The imports bring in AssertJ's `assertThat` and Awaitility's `await` as **static
   }
 ```
 
-**Metrics.** After one `/health` and one `/nothing`, the metrics text on the admin port must contain a counter line for each (`route="GET /health",status="200"} 1` and `route="other",status="404"} 1`), `seatwave_workers 8` and `seatwave_workers_busy 0`. The admin `/health` works and the admin `/other` is 404. One weakness: the server counts a request in a `finally` block after the response has been sent, so a very fast client could read `/metrics` before the previous request was counted. The window is microseconds; the README reports 40 full runs without a failure.
+**Metrics.** After one `/health` and one `/nothing`, the metrics text on the admin port must contain a counter line for each (`route="GET /health",status="200"} 1` and `route="other",status="404"} 1`), `seatwave_workers 8` and `seatwave_workers_busy 0`. The admin `/health` works and the admin `/other` is 404. The server counts a request in a `finally` block after the response has been sent, so a very fast client could read `/metrics` before the previous request was counted. The test therefore waits, with `await().atMost(TIMEOUT).until(...)`, until the text shows both counts and `seatwave_workers_busy 0`, and only then reads it for the assertions; the comment says why. The first version read the metrics once, which the window of a few microseconds made only almost always right.
 
 ```java
   @Test
@@ -857,7 +920,12 @@ package io.plainround.seatwave.proxy.backend;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
 
 class HoldKeysTest {
@@ -911,12 +979,46 @@ After `complete`, the same fingerprint gives `Replay` with the stored reply (rec
 
     assertThat(overflow).isInstanceOf(HoldKeys.Claim.Full.class);
     assertThat(existing).isInstanceOf(HoldKeys.Claim.InProgress.class);
-    assertThat(List.of(overflow, existing)).doesNotHaveDuplicates();
+  }
+
+  @Test
+  void givesOneOfManyRacingClaimsOfOneKeyTheWorkAndKeepsTheLosersOutOfTheCount() throws Exception {
+    HoldKeys keys = new HoldKeys();
+    int racers = 100;
+    CountDownLatch start = new CountDownLatch(1);
+    List<Future<HoldKeys.Claim>> claims = new ArrayList<>();
+    try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+      for (int racer = 0; racer < racers; racer++) {
+        claims.add(
+            pool.submit(() -> {
+              start.await();
+              return keys.claim("\"raced\"", "fingerprint");
+            }));
+      }
+      start.countDown();
+      List<HoldKeys.Claim> outcomes = new ArrayList<>();
+      for (Future<HoldKeys.Claim> claim : claims) {
+        outcomes.add(claim.get());
+      }
+
+      assertThat(outcomes).filteredOn(HoldKeys.Claim.Owner.class::isInstance).hasSize(1);
+      assertThat(outcomes)
+          .filteredOn(HoldKeys.Claim.InProgress.class::isInstance)
+          .hasSize(racers - 1);
+    }
+    // The race took one place in the table. A loser that kept a place would make it full early.
+    for (int keyIndex = 1; keyIndex < HoldKeys.MAX_KEYS; keyIndex++) {
+      assertThat(keys.claim("\"k" + keyIndex + "\"", "fingerprint"))
+          .isInstanceOf(HoldKeys.Claim.Owner.class);
+    }
+    assertThat(keys.claim("\"over\"", "fingerprint")).isInstanceOf(HoldKeys.Claim.Full.class);
   }
 }
 ```
 
-The table limit: claim 100,000 distinct keys, then one more is `Full`; an existing key is still answered (`InProgress`). The last assertion, `doesNotHaveDuplicates` on a list of the two claims, adds little: it only checks that the two results are different objects. No test exercises the lost-race branch of `claim` (another thread wins `putIfAbsent`), and none checks that `Full` does not leak a count.
+The table limit: claim 100,000 distinct keys, then one more is `Full`; an existing key is still answered (`InProgress`). (The first version also asserted `doesNotHaveDuplicates` on the two claims, which proved nothing more and was removed.)
+
+**The race for one key.** 100 virtual threads wait at a `CountDownLatch` (a gate that opens once for everybody when `countDown()` brings it to zero), then all claim the key `"raced"` at the same moment. Exactly one may become `Owner`, and the other 99 must hear `InProgress`. `filteredOn(HoldKeys.Claim.Owner.class::isInstance)` keeps only the outcomes of that type; `Owner.class::isInstance` is a method reference that asks "is this an `Owner`?". A loser may come through the branch where another thread won `putIfAbsent` between its `get` and its `putIfAbsent` (whether one does depends on timing; in one JaCoCo run of version 1.0.1 none did); that branch must give the place it counted back (`size.decrementAndGet()`). The second half proves that no loser keeps a place, whichever way it lost: after the race the table holds one key, so exactly `MAX_KEYS - 1` more keys must fit (each answered `Owner`) before the next is `Full`. A loser that kept its place would make the table full too early.
 
 ### `backend/HoldLedgerTest.java`
 
@@ -988,11 +1090,28 @@ class HoldLedgerTest {
     assertThat(tooEarly).isEmpty();
     assertThat(afterExpiry).isPresent();
     assertThat(ledger.isHeld("B-2")).isTrue();
-    assertThat(ledger.find(first.holdId())).contains(first);
+  }
+
+  @Test
+  void keepsAnExpiredHoldReadableUntilItsSeatIsHeldAgainThenForgetsIt() {
+    MovableClock clock = new MovableClock(NOW);
+    HoldLedger ledger = new HoldLedger(clock);
+    Hold first = ledger.hold(1, "C-3", "fan-1").orElseThrow();
+    clock.advance(HoldLedger.HOLD_DURATION);
+
+    Optional<Hold> expiredButKnown = ledger.find(first.holdId());
+    Hold second = ledger.hold(1, "C-3", "fan-2").orElseThrow();
+
+    assertThat(expiredButKnown).contains(first);
+    // One hold per seat at most: the table cannot grow without end over a long run.
+    assertThat(ledger.find(first.holdId())).isEmpty();
+    assertThat(ledger.find(second.holdId())).contains(second);
   }
 ```
 
-**Expiry.** With a clock the test moves by hand: a hold lasts 300 seconds (`first.expiresAt()` is `NOW + 300 s`). At 299 seconds another customer is refused; at 300 seconds the same request succeeds (the hold is active only while `now` is before the expiry). The seat is held again, and the old hold can still be found by its id: the test pins down that `holdsById` keeps expired holds.
+**Expiry.** With a clock the test moves by hand: a hold lasts 300 seconds (`first.expiresAt()` is `NOW + 300 s`). At 299 seconds another customer is refused; at 300 seconds the same request succeeds (the hold is active only while `now` is before the expiry). The seat is held again.
+
+**An expired hold is forgotten when its seat is held again.** The clock moves to the very end of the hold (`HOLD_DURATION`), so the hold has expired. It can still be read by its id (`expiredButKnown`), which is what `GET /v1/holds/{id}` uses to answer `"state":"expired"`. Then another customer holds the seat. Now the old id finds nothing, and the new one finds the new hold: the ledger keeps at most one hold per seat, so it cannot grow without end. (The first version kept every expired hold, and its test pinned that down.)
 
 ```java
   /** A clock a test moves forward by hand; used by one thread. */
@@ -1026,6 +1145,168 @@ class HoldLedgerTest {
 ```
 
 `MovableClock` is a test double: a subclass of `java.time.Clock` that returns a stored `Instant` and lets the test advance it. The comment says it is used by one thread; it is not thread-safe, and that is fine for this test.
+
+### `backend/SeatWaveRoutesTest.java`
+
+This class calls `SeatWaveRoutes.route` directly, without a server. Some answers cannot be produced on demand over HTTP: a request whose key is still being worked on lasts microseconds, a full key table needs 100,000 earlier holds, and an interrupted long poll needs a stopping server. Calling the routes with a key table and a request the test made itself reaches each of them.
+
+```java
+package io.plainround.seatwave.proxy.backend;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
+
+import io.plainround.seatwave.proxy.forwarded.AddressSource;
+import io.plainround.seatwave.proxy.forwarded.ClientView;
+import io.plainround.seatwave.proxy.json.JsonCodec;
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.Test;
+
+/**
+ * The routes' answers that cannot be reached over HTTP on demand: a key that is still running, a
+ * full key table and a long poll interrupted by a stopping server.
+ */
+```
+
+The imports: `MessageDigest` and `HexFormat` compute a SHA-256 fingerprint the way the routes do; `CompletableFuture` runs code on another thread and hands back its result; `AtomicReference` is a box that one thread fills and another reads safely. The class comment says why the class exists.
+
+```java
+class SeatWaveRoutesTest {
+
+  private static final String KEY = "\"key-1\"";
+  private static final String BODY = "{\"eventId\":1,\"seat\":\"A-1\",\"customer\":\"fan-1\"}";
+  private static final ClientView CLIENT =
+      new ClientView(InetAddress.getLoopbackAddress(), "http", AddressSource.PEER);
+
+  private final HoldKeys keys = new HoldKeys();
+  private final SeatWaveRoutes routes =
+      new SeatWaveRoutes(
+          new HoldLedger(Clock.systemUTC()),
+          keys,
+          new BackendSettings.Timing(
+              Duration.ofSeconds(30), Duration.ofMillis(100), Duration.ofMillis(350)),
+          new JsonCodec());
+```
+
+- `KEY` is one Idempotency-Key in its quoted form, and `BODY` a valid hold body.
+- `CLIENT` is a decided client: the loopback address, plain `http`, the source `PEER`. A route never decides the client itself; it receives one.
+- `keys` is the key table, made here so the test can fill it, and given to the routes through their constructor. The routes get a fresh ledger, a long poll of 30 seconds (long enough that only an interrupt ends it), and a codec. JUnit makes a new object of this class for each test, so every test has a fresh table.
+
+```java
+  @Test
+  void tellsASecondRequestWithARunningKeyToRetryLaterWithConflict() throws Exception {
+    Request first = hold(BODY);
+    // The routes fingerprint a body by its SHA-256; a wrong guess here would answer 422, not 409.
+    keys.claim(KEY, sha256(first.body()));
+
+    Reply.Body second = (Reply.Body) routes.route(first).reply();
+
+    assertThat(second.status()).isEqualTo(409);
+    assertThat(text(second)).contains("problems/request-in-progress");
+  }
+```
+
+**A key still running.** The test claims the key itself first, with the same fingerprint the routes will compute: `sha256(first.body())`. To the routes this looks exactly like an earlier request with the same key and body that has not finished. The answer must be `409` with the problem type `request-in-progress`, the one the seat page now retries. The comment explains the safety of the guess: a wrong fingerprint would look like another body, and the answer would be `422`, so the test cannot pass by accident. `(Reply.Body)` is a **cast**: it tells the compiler that this reply is a whole body, which `status()` and `body()` need.
+
+```java
+  @Test
+  void refusesANewKeyWithServiceBusyWhenTheKeyTableIsFull() {
+    for (int keyIndex = 0; keyIndex < HoldKeys.MAX_KEYS; keyIndex++) {
+      keys.claim("\"k" + keyIndex + "\"", "fingerprint");
+    }
+
+    Reply.Body refused = (Reply.Body) routes.route(hold(BODY)).reply();
+
+    assertThat(refused.status()).isEqualTo(503);
+    assertThat(refused.headers()).contains(Map.entry("Retry-After", "1"));
+    assertThat(text(refused)).contains("problems/service-busy", "the key table is full");
+  }
+```
+
+**A full table.** 100,000 claims fill the table, so a new key gets `503 Service Unavailable` with `Retry-After: 1` and the detail `the key table is full`. `Map.entry("Retry-After", "1")` is the header as the reply stores it, a name and value pair.
+
+```java
+  @Test
+  void endsALongPollWithServiceBusyWhenTheServerInterruptsIt() throws Exception {
+    AtomicReference<Thread> worker = new AtomicReference<>();
+    Request poll =
+        new Request(
+            "GET",
+            "/v1/events/1/seat-changes",
+            "after=1:42",
+            Map.of(),
+            new byte[0],
+            false,
+            CLIENT,
+            "c1");
+    CompletableFuture<Reply> answer =
+        CompletableFuture.supplyAsync(() -> {
+          worker.set(Thread.currentThread());
+          return routes.route(poll).reply();
+        });
+    // The poll waits 30 s; interrupting its thread is what BackendServer.close does.
+    await()
+        .atMost(Duration.ofSeconds(10))
+        .until(() -> worker.get() != null && worker.get().getState() == Thread.State.TIMED_WAITING);
+
+    worker.get().interrupt();
+    Reply.Body stopped = (Reply.Body) answer.get();
+
+    assertThat(stopped.status()).isEqualTo(503);
+    assertThat(text(stopped)).contains("the server is stopping");
+  }
+```
+
+**An interrupted long poll.** The long poll runs on another thread through `CompletableFuture.supplyAsync`, which first puts its own thread into `worker`. The test waits until that thread is in `TIMED_WAITING`, the state of a thread inside `Thread.sleep`, which proves the poll has started its wait. Then `interrupt()` does what `BackendServer.close` does to every running request. The route must stop waiting at once and answer `503` with `the server is stopping`. `answer.get()` waits for the other thread's result.
+
+```java
+  @Test
+  void namesNoPointerWhenTheWholeBodyIsAtFault() {
+    Reply.Body refused = (Reply.Body) routes.route(hold("[1]")).reply();
+
+    assertThat(refused.status()).isEqualTo(400);
+    assertThat(text(refused)).contains("\"detail\":\"the body must be a JSON object\"");
+  }
+```
+
+**A whole-body problem.** The body `[1]` is not a JSON object, so the problem has an empty pointer. The detail must be exactly `the body must be a JSON object`, with no space in front; the first version joined the empty pointer, a space and the detail.
+
+```java
+  private static Request hold(String body) {
+    return new Request(
+        "POST",
+        "/v1/holds",
+        "",
+        Map.of("content-type", List.of("application/json"), "idempotency-key", List.of(KEY)),
+        body.getBytes(StandardCharsets.UTF_8),
+        false,
+        CLIENT,
+        "c1");
+  }
+
+  private static String sha256(byte[] body) throws NoSuchAlgorithmException {
+    return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(body));
+  }
+
+  private static String text(Reply.Body body) {
+    return new String(body.body(), StandardCharsets.UTF_8);
+  }
+}
+```
+
+- `hold(body)` builds a `POST /v1/holds` request by hand, as `BackendServer.request` would: lower-case header names, the JSON media type, the key, the body as UTF-8 bytes, not too large, the decided client and a correlation id.
+- `sha256(body)` is the fingerprint: `MessageDigest.getInstance("SHA-256").digest(body)` gives 32 bytes, and `HexFormat.of().formatHex(...)` writes them as 64 hexadecimal characters.
+- `text(body)` turns a reply's bytes back into text for the assertions.
 
 ### `backend/SeatCatalogTest.java`
 
@@ -1163,6 +1444,38 @@ Start from the local file and break it five ways at once: the TLS port equals th
 
 ```java
   @Test
+  void reportsMissingStreamKeysOnceWithoutTheRuleBetweenThem() throws IOException {
+    Properties file = SettingsReader.load(Path.of("config/backend-local.properties"));
+    file.remove("feed.heartbeatMillis");
+    file.remove("feed.streamLifetimeMillis");
+
+    Result<BackendSettings, List<String>> result = BackendSettings.from(new SettingsReader(file));
+
+    assertThat(((Result.Error<BackendSettings, List<String>>) result).error())
+        .containsExactly("feed.heartbeatMillis is missing", "feed.streamLifetimeMillis is missing");
+  }
+
+  @Test
+  void refusesAShortIpv4FormAsATrustedProxy() throws IOException {
+    Properties file = SettingsReader.load(Path.of("config/backend-local.properties"));
+    // 127.0.1 is the old BSD short form of 127.0.0.1: written by mistake, it must not trust anyone.
+    file.setProperty("forwarded.trustedProxies", "127.0.1");
+
+    Result<BackendSettings, List<String>> result = BackendSettings.from(new SettingsReader(file));
+
+    assertThat(((Result.Error<BackendSettings, List<String>>) result).error())
+        .containsExactly(
+            "forwarded.trustedProxies: a trusted proxy must be an IP address, but was '127.0.1'");
+  }
+
+```
+
+**Missing stream keys give one line each.** The test removes both stream keys from the local settings. The problems must be exactly the two "is missing" lines, in file order (`containsExactly`), and no third line about the rule between them: that rule must not run on the reader's stand-in values. The cast `(Result.Error<BackendSettings, List<String>>) result` takes the error list out of the `Result`.
+
+**A short IPv4 form is not a trusted proxy.** `127.0.1` is how old BSD systems wrote `127.0.0.1`, and `InetAddress.ofLiteral` still accepts it. It passes the settings pattern (digits and dots, 7 characters), so only the strict address rule of `TrustedProxies.parse` refuses it, with exactly one problem line. The comment says why it matters: a typo must not trust anybody.
+
+```java
+  @Test
   void refusesListenersThatShareAPortWhenBuiltDirectly() {
     BackendSettings.Timing timing = TestBackend.quickTiming();
 
@@ -1246,6 +1559,28 @@ A settings file with only `http.plainPort=x` (written into a temporary folder th
 
 ```java
   @Test
+  void refusesASettingsFileWithABrokenEscapeWithoutAStackTrace(@TempDir Path folder)
+      throws IOException {
+    Path file =
+        Files.writeString(
+            folder.resolve("broken.properties"),
+            "http.bindAddress=\\u12\n",
+            StandardCharsets.UTF_8);
+
+    Optional<BackendServer> server =
+        BackendCli.start(new String[] {file.toString()}, print(out), print(err));
+
+    assertThat(server).isEmpty();
+    assertThat(err.toString(StandardCharsets.UTF_8))
+        .contains("is not a valid properties file: Malformed \\uxxxx encoding.");
+  }
+
+```
+
+**A broken escape.** The file holds `http.bindAddress=\u12`: a `\u` escape with only two hexadecimal digits. In the Java text `"http.bindAddress=\\u12\n"`, the double backslash is one real backslash in the file. `Properties.load` refuses it with an unchecked exception; the test proves that the command answers with a problem line (`is not a valid properties file: Malformed \uxxxx encoding.`) and no server, which `main` turns into exit status 2, and not with a stack trace. In the first version this file stopped the program with `IllegalArgumentException`.
+
+```java
+  @Test
   void saysWhichTlsFileIsMissing(@TempDir Path folder) throws IOException {
     String settings =
         Files.readString(Path.of("config/backend-local.properties"), StandardCharsets.UTF_8)
@@ -1295,7 +1630,7 @@ The local settings are copied with the key store path changed to a file that doe
   }
 ```
 
-A valid start: the local settings with ports 0 and the key store path rewritten to the absolute TEST folder (`.replace("build/tls/", TestBackend.TLS + "/")`). The command must print the plain-HTTP line, `(TLSv1.3)`, and `64 worker threads, trusted proxies [127.0.0.1]`. The `finally` block closes the server whatever happens. **This test fails when the repository sits in a deep folder.** `BackendSettings` only accepts file paths of at most 200 characters made of letters, digits and `_ . / -`. In a copy under a scratch folder whose absolute path to `seatwave-server.p12` is 211 characters, the test failed (`Expecting Optional to contain a value but it was empty`) and the error stream said `tls.keystore must match [A-Za-z0-9_./-]{1,200}, but was <repo>/build/tls/seatwave-server.p12`. A folder name with a space or a plus sign would break it the same way. The paths of the real project (about 100 characters) are fine.
+A valid start: the local settings with ports 0 and the key store path rewritten to the absolute TEST folder (`.replace("build/tls/", TestBackend.TLS + "/")`). The command must print the plain-HTTP line, `(TLSv1.3)`, and `64 worker threads, trusted proxies [127.0.0.1]`. The `finally` block closes the server whatever happens. The test writes an absolute path into the settings, so it also proves that a path as deep as the checkout is accepted. In version 1.0.0 it failed in a deep folder: `BackendSettings` accepted file paths of at most 200 characters made of letters, digits and `_ . / -`, and in a copy whose absolute path to `seatwave-server.p12` was 211 characters, the error stream said `tls.keystore must match [A-Za-z0-9_./-]{1,200}, but was <repo>/build/tls/seatwave-server.p12`. A folder name with a space or a plus sign broke it the same way. Since 1.0.1 a path may hold any character but a control character, up to 4,096; the review pass ran `./gradlew check` in a checkout 270 characters deep and in one under a folder named `folder with space+plus`, and both passed.
 
 ```java
   private static PrintStream print(ByteArrayOutputStream bytes) {
@@ -1332,15 +1667,9 @@ They pass (`BackendServerTest` has the 3-second queue test, so allow some second
 ./gradlew clean check
 ```
 
-In the repository folder the README reports 119 tests, 0 failures and 91.8 percent line coverage (1,937 of 2,111 lines). In my copy under a long path, 119 tests ran and 2 failed: `BackendCliTest.startsAndPrintsItsListenersFromAValidFile` (the path length above) and `BenchCliTest.stopsWithExitStatusOneWhenTheContainersCannotBeRead` of the `bench` package (not examined here). Coverage in that run was 90.1 percent (1,902 of 2,111 lines). In my copy the lines of `BackendCli.start` after the settings check were not executed because of the first failure.
+In the final run of version 1.0.1 it ran 166 tests with 0 failures, and line coverage was 95.5 percent (2,108 of 2,208 lines). Version 1.0.0, in a copy under a long path, ran 119 tests and 2 failed, `BackendCliTest.startsAndPrintsItsListenersFromAValidFile` and `BenchCliTest.stopsWithExitStatusOneWhenTheContainersCannotBeRead`, both because of the old path rule above.
 
-**4. See that the long-path failure is the path.** In a copy of the test, print the error stream before the assertion:
-
-```
-System.out.println("ERRTEXT:" + err.toString(StandardCharsets.UTF_8));
-```
-
-The run printed the `tls.keystore must match ...` and `tls.passwordFile must match ...` lines quoted above.
+**4. Run the tests from a deep folder.** Copy the repository (without `build`) into a folder whose path is longer than 220 characters, or one with a space in its name, and run `./gradlew check` there. It passes. With version 1.0.0 the same copy failed with the `tls.keystore must match ...` and `tls.passwordFile must match ...` lines quoted above.
 
 **5. Open the report.** After a run, `build/reports/tests/test/index.html` lists every test with its time, and `build/reports/jacoco/test/html/index.html` shows the coverage per class.
 
@@ -1348,11 +1677,11 @@ The run printed the `tls.keystore must match ...` and `tls.passwordFile must mat
 
 - **Sleeping instead of waiting.** `Thread.sleep(500)` is a guess. `await().until(condition)` waits as long as needed and no longer.
 - **Sharing state between tests.** Each test here gets its own server. The ledger and the key table are in memory, so a shared server would carry holds from one test to the next.
-- **Reusing an Idempotency-Key across cases.** The tests use a different key for each case (`key-1` to `key-8`); reusing one would replay an earlier answer.
-- **Asserting too little.** `contains("A-1")` also matches `A-10`. Check the whole line when exactness matters.
-- **Absolute paths in settings.** The 200-character rule makes one test depend on how deep the clone is.
+- **Reusing an Idempotency-Key across cases.** The tests use a different key for each case (`key-1` to `key-10`); reusing one would replay an earlier answer.
+- **Asserting too little.** `contains("A-1")` also matches `A-10`. Check the label with its quotes, and count the items, when exactness matters.
+- **A settings rule stricter than the thing it checks.** A path rule of 200 safe characters made two tests depend on how deep the clone was. Allow what a real path may hold.
 - **Assuming a refused request returns a status.** A queue refusal closes the connection; the client sees an exception.
-- **Counting after the response.** Metrics updated after the response is sent can be read late by a very fast client; the tests accept this tiny window.
+- **Counting after the response.** Metrics updated after the response is sent can be read late by a very fast client. Wait for the expected count with Awaitility instead of reading it once.
 
 ## Check yourself
 
@@ -1360,7 +1689,7 @@ The run printed the `tls.keystore must match ...` and `tls.passwordFile must mat
 2. How does the test that makes the queue overflow know the only worker is busy? Answer: it waits (Awaitility) until `/metrics` shows `seatwave_workers_busy 1`.
 3. What proves that only one of 100 racers holds seat A-7? Answer: `HoldLedgerTest` starts 100 threads at one latch and counts non-empty results; it must be exactly 1, because `compute` makes the check and the write one step.
 4. What does the cursor `czEuQS0xMDAw` mean? Answer: Base64 for `s1.A-1000`: "after seat A-1000", so the next page starts at `B-1`.
-5. Why does `BackendCliTest.startsAndPrintsItsListenersFromAValidFile` fail in a deep folder? Answer: the settings rule for file paths allows at most 200 characters; the test writes the absolute key store path into the settings, and it is longer than that.
+5. Why did `BackendCliTest.startsAndPrintsItsListenersFromAValidFile` fail in a deep folder in version 1.0.0, and why not now? Answer: the old settings rule for file paths allowed at most 200 characters of a few kinds, and the test writes the absolute key store path into the settings. The rule now allows any path without control characters.
 
 ## Further reading
 

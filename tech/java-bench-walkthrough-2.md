@@ -649,11 +649,13 @@ public final class LoadRun {
       String path =
           scenario.uri().getRawPath()
               + (scenario.uri().getRawQuery() == null ? "" : "?" + scenario.uri().getRawQuery());
+      // The Host header as HttpClient writes it: with the port, so both modes send the same
+      // request.
       String head =
           "GET "
               + path
               + " HTTP/1.1\r\nHost: "
-              + host
+              + scenario.uri().getRawAuthority()
               + "\r\nConnection: close\r\n"
               + (scenario.acceptsGzip() ? "Accept-Encoding: gzip\r\n" : "")
               + "\r\n";
@@ -673,7 +675,7 @@ public final class LoadRun {
 - It is written as ASCII bytes and flushed. `readAllBytes()` reads until the server closes the connection, which `Connection: close` makes it do after the answer.
 - The deadline check after the read throws if the whole exchange took longer than the request timeout. `setSoTimeout` alone limits only one read at a time, so a server that trickled bytes could otherwise exceed the timeout.
 - `RawResponse.parse(whole)` does the rest.
-- The `Host` header has the host without the port. The reused path (`HttpClient`) sends the port as well.
+- The `Host` header is `scenario.uri().getRawAuthority()`: the host and the port as the address writes them, `127.0.0.1:20904` for example. The comment says why: `HttpClient`, which the reused mode uses, sends the port too, so both modes now send the same request. The first version sent the host alone here. NGINX's `$host` drops the port either way, so the lab's numbers did not depend on it; `LoadRunTest.sendsTheSameHostHeaderWithThePortInBothModes` checks it.
 
 ```java
   private static Tally await(Future<Tally> tally) throws InterruptedException, IOException {
@@ -859,11 +861,27 @@ public final class BenchCli {
     if (loaded.isEmpty()) {
       return EXIT_BAD_USAGE;
     }
-    BenchSettings settings = loaded.get();
+    return bench(loaded.get(), counters, out, err);
+  }
+
+  /**
+   * Runs every scenario of checked settings and prints the table.
+   *
+   * @param settings the checked settings
+   * @param counters reads each container's counters
+   * @param out where the table is printed
+   * @param err where problems are printed
+   * @return 0, or 1 if the stack could not be reached or read
+   * @throws InterruptedException if the thread is interrupted during a run
+   */
+  static int bench(
+      BenchSettings settings, ContainerCounters counters, PrintStream out, PrintStream err)
+      throws InterruptedException {
 ```
 
 - `run(arguments, counters, out, err)` takes the output streams as parameters. `PrintStream` is a stream with `println` and `printf`; in production they are `System.out` and `System.err`, and in tests they are in-memory buffers.
 - Exactly one argument is required: the settings file. Otherwise it prints the usage and returns 2.
+- `run` checks the command line and the file, then hands the checked settings to `bench`, which does the work. `bench` is package-private (no `public`), so `BenchCliTest` can call it with settings it built itself, pointing at an in-process SeatWave, which `config/bench.properties` (ports 20900 to 20999 only) would not allow.
 - `SettingsFiles.load(Path.of(arguments[0]), BenchSettings::from, err)` reads the file, builds the settings, and prints every problem to `err` if it cannot. `BenchSettings::from` is a **method reference**: it passes the method as the function that turns a reader into settings. The result is an `Optional`: a box that holds a value or nothing. Empty means the problems were printed, so return 2.
 
 ```java
@@ -905,7 +923,7 @@ public final class BenchCli {
 
 - `out.println(BenchReport.HEADER)` prints the table's header line once. For each scenario, `measure(...)` returns the list of runs and `BenchReport.render` prints the row. Each row appears when its scenario has finished, so the first row can take 5 + 3 x 10 seconds to appear.
 - `return 0` means success. `catch (IOException stackFailed)` covers a refused certificate file, a container that cannot be read, a client that did not finish: it prints `the bench stopped: ...` to `err` and returns 1. Rows already printed stay printed.
-- `IllegalArgumentException` (for example a negative counter difference after a container restart) is not caught here, so it would end the program with a Java stack trace.
+- A counter that went down during a run (the container restarted) arrives here as an `IOException` from `growth` (below), so it also ends with `the bench stopped: ...` and status 1.
 
 ```java
   private static List<BenchRow> measure(
@@ -923,16 +941,35 @@ public final class BenchCli {
       Counters backendAfter = counters.read(settings.backendContainer());
       runs.add(
           new BenchRow(
-              scenario, result, proxyAfter.since(proxyBefore), backendAfter.since(backendBefore)));
+              scenario,
+              result,
+              growth(settings.proxyContainer(), proxyBefore, proxyAfter),
+              growth(settings.backendContainer(), backendBefore, backendAfter)));
     }
     return runs;
+  }
+
+  private static Counters growth(String container, Counters before, Counters after)
+      throws IOException {
+    try {
+      return after.since(before);
+    } catch (IllegalArgumentException wentDown) {
+      // A counter that went down means the container started again during the run, so the run
+      // measured nothing; that is a failure of the stack, reported like one, not a stack trace.
+      throw new IOException(
+          "the counters of "
+              + container
+              + " went down during a run, so the container restarted; run the bench again",
+          wentDown);
+    }
   }
 }
 ```
 
 - `measure` runs one scenario. If the warm-up is not zero, it runs the scenario once for the warm-up time and ignores the result.
-- For each repeat: read both containers' counters, run the load, read both counters again, and build a `BenchRow` whose counters are the differences (`after.since(before)`). The four reads happen outside the timed run. Each one starts a small `cat` process inside the container, which adds a little processor time to that container's counter around the run. The amount is small next to a 10-second run, but it is not zero.
+- For each repeat: read both containers' counters, run the load, read both counters again, and build a `BenchRow` whose counters are the differences (`growth(...)`, which is `after.since(before)`). The four reads happen outside the timed run. Each one starts a small `cat` process inside the container, which adds a little processor time to that container's counter around the run. The amount is small next to a 10-second run, but it is not zero.
 - The list of rows is returned to `BenchReport.render`.
+- `growth(container, before, after)` computes the difference. `since` throws `IllegalArgumentException` when a counter went down, which happens only when the container started again between the two readings, so its counters began again at zero. That is a failure of the stack, not a bug in the code, so `growth` turns it into an `IOException` whose message names the container and says what to do: `the counters of seatwave-proxy-proxy-1 went down during a run, so the container restarted; run the bench again`. `BenchCliTest.stopsWithExitStatusOneWhenAContainerRestartsDuringARun` checks it with a stand-in `docker` that reports lower numbers each time.
 
 ## Try it yourself
 
@@ -992,16 +1029,17 @@ public class TryLoad {
 java -cp build/classes/java/main build/TryLoad.java
 ```
 
-The program uses the same `LoadRun` as the bench, with 4 clients for 2 seconds, three runs per mode, and zero counters, because there is no container to read. The output on the writer's machine (with port 20980 in the address):
+The program uses the same `LoadRun` as the bench, with 4 clients for 2 seconds, three runs per mode, and zero counters, because there is no container to read. The output of a run with version 1.0.1, on port 20930, while other programs kept the machine busy:
 
 ```text
-local-reuse          11794     0.31     0.90       0        36894         36894      -              0.0                 0.0               0             0                  0
-  runs (rps): 8231 (16468 in 2.0 s), 11794 (23591 in 2.0 s), 13383 (26768 in 2.0 s)
-local-new              811     4.90     9.59       0        36894         36894      -              0.0                 0.0               0             0                  0
-  runs (rps): 711 (1424 in 2.0 s), 811 (1623 in 2.0 s), 822 (1647 in 2.0 s)
+local-reuse          11223     0.28     1.18       0        36894         36894      -              0.0                 0.0               0             0                  0
+  runs (rps): 5669 (11341 in 2.0 s), 11223 (22452 in 2.0 s), 13210 (26423 in 2.0 s)
+  warning: the runs differ by more than 2 times (5669 to 13210 rps), so the median is not a steady rate
+local-new              549     6.89    15.19       0        36894         36894      -              0.0                 0.0               0             0                  0
+  runs (rps): 517 (1034 in 2.0 s), 549 (1099 in 2.0 s), 598 (1198 in 2.0 s)
 ```
 
-Read it: with reuse, the median run was 11,794 requests per second; the three runs were 8,231, 11,794 and 13,383. The first run is the slowest: it paid for loading and compiling code, which is why the real bench has a warm-up. With a new connection and a full TLS handshake for every request, the same server answered about 811 per second, and the p50 latency was 4.90 ms instead of 0.31 ms. Each response was 36,894 bytes on the wire and after decompression, which is the seat map of section A. Stop SeatWave with Ctrl-C afterwards.
+Read it: with reuse, the median run was 11,223 requests per second; the three runs were 5,669, 11,223 and 13,210. The first run is the slowest: it paid for loading and compiling code, which is why the real bench has a warm-up. This program has none, and the spread was wide enough for the report to print its warning line under the row. With a new connection and a full TLS handshake for every request, the same server answered about 549 per second, and the p50 latency was 6.89 ms instead of 0.28 ms. Each response was 36,894 bytes on the wire and after decompression, which is the seat map of section A. Stop SeatWave with Ctrl-C afterwards.
 
 **2. Run the bench with a missing or bad settings file.** No Docker is needed:
 
@@ -1055,7 +1093,7 @@ Error[error=no usage_usec line: the control group's cpu.stat was not read]
 ./gradlew test --tests '*LoadRunTest' --tests '*RawResponseTest' --tests '*ContainerCountersTest' --tests '*BenchCliTest'
 ```
 
-`BUILD SUCCESSFUL`. One of them, `BenchCliTest`, builds a path to the test certificates; if the repository sits inside a folder path longer than about 170 characters, the settings pattern `FILE` (200 characters at most) refuses it and that test fails. The cause is the path length, not the code.
+`BUILD SUCCESSFUL`. One of them, `BenchCliTest`, writes an absolute path to the test certificates into a settings file; in version 1.0.0 that failed in a folder path longer than about 170 characters, because the old file-path pattern allowed 200 characters at most. Version 1.0.1 accepts any path without control characters.
 
 ## Mistakes people make
 

@@ -74,7 +74,7 @@ services:
   backend:
     <<: *hardening
     build: .
-    image: seatwave-proxy-backend:1.0.0
+    image: seatwave-proxy-backend:1.0.1
     cap_drop:
       - ALL
     # Module 1's reference machine has 4 vCPU; SeatWave gets 4 CPUs of the Docker virtual machine.
@@ -95,7 +95,7 @@ services:
 
 - Line 17 starts the list of services; line 18 names the first one, `backend`. The name is yours. It becomes part of the container name and a name on the network.
 - Line 19, `<<: *hardening`, merges the two keys of `x-hardening` into this service. That is the same as writing `security_opt` and `read_only` here.
-- Line 20, `build: .`, says: build the image from the `Dockerfile` in this folder (`.` is the folder holding `compose.yaml`). Line 21, `image: seatwave-proxy-backend:1.0.0`, is the name and tag to give the result, so other services can use it by name. See `docker.md`.
+- Line 20, `build: .`, says: build the image from the `Dockerfile` in this folder (`.` is the folder holding `compose.yaml`). Line 21, `image: seatwave-proxy-backend:1.0.1`, is the name and tag to give the result, so other services can use it by name. See `docker.md`.
 - Lines 22 and 23 are `cap_drop:` with the list item `ALL`. A **capability** is one small piece of the administrator's power, such as binding a port below 1024 or changing a file's owner. `ALL` removes every one. SeatWave listens on ports above 1024 and needs none of them. (This is also why every port inside this lab is above 1024.)
 - Line 24 is a comment: Module 1's reference machine has 4 virtual CPUs, so SeatWave gets 4. Line 25, `cpus: 4`, caps the container at four CPUs' worth of time. Docker stores it as `NanoCpus=4000000000`. Line 26, `mem_limit: 1g`, caps memory at one gibibyte; Docker stores `1073741824` bytes. If the program tries to use more, the kernel kills it. (The Java option `-XX:MaxRAMPercentage=50` in the `Dockerfile` is a percentage of this limit.)
 - Lines 27 and 28 give the container a `tmpfs` at `/tmp`. Java and the JDK's HTTP server write temporary files there, and the root file system is read-only.
@@ -162,8 +162,10 @@ services:
       - SETGID
       - SETUID
     # One CPU, and one worker process in nginx.conf: every proxy number is per core. The memory
-    # limit covers the tmpfs folders too (their pages count against it): the cache and the
-    # temporary files of buffered responses, and the access log of a whole bench run.
+    # limit covers the tmpfs folders too: a page written to a tmpfs counts against the container's
+    # memory. Their sizes are ceilings, not reservations, and add up to 901 MB of the 1 GiB; they
+    # never fill together: the cache stays under its max_size of 100m (nginx.conf), and the access
+    # log of a whole measuring session stays well under 600m (README, "The stack").
     cpus: 1
     mem_limit: 1g
     tmpfs:
@@ -195,11 +197,11 @@ services:
 - Lines 62 to 65 are the same pattern as the sidecar: hardening, the pinned image, the entry point without the helper scripts. The proxy keeps the default network behavior: it is on the `lab` network (lines 88 to 90), with its own address.
 - Lines 66 to 68: `depends_on` lists `backend` and `sidecar`, so both start before the proxy. Again: start order only.
 - Lines 69 to 74: capabilities, the same three as the sidecar.
-- Lines 75 to 77 are a comment: one CPU and one worker process in `nginx.conf`, so every proxy number is "per core". The memory limit counts the pages of the tmpfs folders too: the cache, the temporary files of buffered responses and the access log of a whole bench run. Line 78, `cpus: 1`, and line 79, `mem_limit: 1g`, set the limits. The sum of the tmpfs sizes (300 MB + 600 MB + 1 MB) stays under 1 GiB.
-- Lines 80 to 83: three tmpfs folders. `/var/cache/nginx:size=300m` holds the response cache (the `proxy_cache_path` is `/var/cache/nginx/seatwave`, up to `max_size=100m`) and the temporary files. `/var/log/nginx/seatwave:size=600m` holds the access log (`access_log /var/log/nginx/seatwave/access.log seatwave;`), in memory so that writing 1.5 million log lines does not slow the proxy by touching a disk. `/run:size=1m` holds the pid file.
-- Lines 84 to 87: three read-only mounts. `./nginx/nginx.conf` replaces `/etc/nginx/nginx.conf`. The folder `./nginx/seatwave` appears as `/etc/nginx/seatwave`, which is why the configuration says `include seatwave/upstreams.conf;`. And `build/tls` appears at `/etc/nginx/tls`. The image's own `/etc/nginx/mime.types` stays, because only the one file and the one folder are replaced.
-- Lines 88 to 90: attach to `lab` with the fixed address `10.209.9.10`. SeatWave trusts forwarded headers only from this address.
-- Lines 91 to 103: twelve published ports, all on `127.0.0.1`. The container port is the port an NGINX `server` block listens on. Here is the map (the block is in `nginx/seatwave/`):
+- Lines 75 to 79 are a comment: one CPU and one worker process in `nginx.conf`, so every proxy number is "per core". The memory limit also counts the tmpfs folders. A tmpfs keeps its files in memory, and Linux charges every page written to it to the memory **control group** (cgroup) of the container that wrote it, so a full log folder is memory the container no longer has. The sizes are ceilings, not reservations: nothing is taken until a file is written. Together they come to 901 MB (300 + 600 + 1) of the 1 GiB, which would leave NGINX 123 MB if both filled; the comment says why they do not fill together: the cache is capped at `max_size=100m` in `nginx.conf`, and a whole measuring session's log stays well under 600 MB (the README gives the measured size). Line 80, `cpus: 1`, and line 81, `mem_limit: 1g`, set the limits.
+- Lines 82 to 85: three tmpfs folders. `/var/cache/nginx:size=300m` holds the response cache (the `proxy_cache_path` is `/var/cache/nginx/seatwave`, up to `max_size=100m`) and the temporary files. `/var/log/nginx/seatwave:size=600m` holds the access log (`access_log /var/log/nginx/seatwave/access.log seatwave;`), in memory so that writing 1.5 million log lines does not slow the proxy by touching a disk. `/run:size=1m` holds the pid file.
+- Lines 86 to 89: three read-only mounts. `./nginx/nginx.conf` replaces `/etc/nginx/nginx.conf`. The folder `./nginx/seatwave` appears as `/etc/nginx/seatwave`, which is why the configuration says `include seatwave/upstreams.conf;`. And `build/tls` appears at `/etc/nginx/tls`. The image's own `/etc/nginx/mime.types` stays, because only the one file and the one folder are replaced.
+- Lines 90 to 92: attach to `lab` with the fixed address `10.209.9.10`. SeatWave trusts forwarded headers only from this address.
+- Lines 93 to 105: twelve published ports, all on `127.0.0.1`. The container port is the port an NGINX `server` block listens on. Here is the map (the block is in `nginx/seatwave/`):
 
 | On your computer | In the container | Which `server` block |
 |---|---|---|
@@ -225,7 +227,7 @@ I listed the published ports of the running proxy and they match this table. The
   # Only started on demand (profile "tools"); it publishes no port.
   tools:
     <<: *hardening
-    image: seatwave-proxy-backend:1.0.0
+    image: seatwave-proxy-backend:1.0.1
     profiles:
       - tools
     entrypoint: ["/opt/seatwave-java/bin/java", "-cp", "/app/lib/*", "io.plainround.seatwave.proxy.slow.SlowClientsCli"]
@@ -240,11 +242,11 @@ I listed the published ports of the running proxy and they match this table. The
         ipv4_address: 10.209.9.30
 ```
 
-- Lines 105 and 106 are comments: it runs the slow-client lab inside the lab network, started on demand with `docker compose run --rm tools <settings>`, and publishes no port.
-- Line 108 is the hardening merge. Line 109 reuses the backend's image by name. There is no `build:` here, so that image must exist; `docker compose up` builds it through the `backend` service.
-- Lines 110 and 111: `profiles: - tools`. A **profile** is a label. A service with a profile is skipped by a plain `docker compose up`, and starts only when you name the profile or run the service explicitly. That is why `stack.sh up` starts three containers and not four. (`docker compose config --profiles` prints `tools`.)
-- Line 112 replaces the entry point with `java -cp "/app/lib/*" io.plainround.seatwave.proxy.slow.SlowClientsCli`. The image's own `CMD` is not used; the settings file you pass on the command line becomes the program's argument. See `java-slow-clients-walkthrough.md`.
-- Lines 113 to 121: all capabilities dropped, two CPUs, 512 MB, a tmpfs at `/tmp`, and the fixed address `10.209.9.30` on `lab`. The slow clients run inside the lab network on purpose: Docker Desktop's port forwarder would buffer on its own and hide what the proxy's buffering does (`ARCHITECTURE.md`).
+- Lines 107 and 108 are comments: it runs the slow-client lab inside the lab network, started on demand with `docker compose run --rm tools <settings>`, and publishes no port.
+- Line 110 is the hardening merge. Line 111 reuses the backend's image by name. There is no `build:` here, so that image must exist; `docker compose up` builds it through the `backend` service.
+- Lines 112 and 113: `profiles: - tools`. A **profile** is a label. A service with a profile is skipped by a plain `docker compose up`, and starts only when you name the profile or run the service explicitly. That is why `stack.sh up` starts three containers and not four. (`docker compose config --profiles` prints `tools`.)
+- Line 114 replaces the entry point with `java -cp "/app/lib/*" io.plainround.seatwave.proxy.slow.SlowClientsCli`. The image's own `CMD` is not used; the settings file you pass on the command line becomes the program's argument. See `java-slow-clients-walkthrough.md`.
+- Lines 115 to 123: all capabilities dropped, two CPUs, 512 MB, a tmpfs at `/tmp`, and the fixed address `10.209.9.30` on `lab`. The slow clients run inside the lab network on purpose: Docker Desktop's port forwarder would buffer on its own and hide what the proxy's buffering does (`ARCHITECTURE.md`).
 
 ### The network
 
@@ -256,8 +258,8 @@ networks:
         - subnet: 10.209.9.0/24
 ```
 
-- Line 123 starts the top-level `networks:` section; line 124 names the network `lab`. Compose creates it as `<project>_lab`, here `seatwave-proxy_lab`.
-- Lines 125 to 127: `ipam` (IP address management) holds the address plan. `subnet: 10.209.9.0/24` means all addresses from `10.209.9.0` to `10.209.9.255`. `10.209.9.0/24` is a private range, not reachable from the internet. Docker's convention is to give the first usable address, `10.209.9.1`, to the network's gateway (the virtual router). A request that comes from your Mac through Docker Desktop reaches the containers from that address: both the README and my run show `"address":"10.209.9.1"` from `GET /lab/client`. That is also why `nginx/seatwave/status.conf` allows `10.209.9.0/24`.
+- Line 125 starts the top-level `networks:` section; line 126 names the network `lab`. Compose creates it as `<project>_lab`, here `seatwave-proxy_lab`.
+- Lines 127 to 129: `ipam` (IP address management) holds the address plan. `subnet: 10.209.9.0/24` means all addresses from `10.209.9.0` to `10.209.9.255`. `10.209.9.0/24` is a private range, not reachable from the internet. Docker's convention is to give the first usable address, `10.209.9.1`, to the network's gateway (the virtual router). A request that comes from your Mac through Docker Desktop reaches the containers from that address: both the README and my run show `"address":"10.209.9.1"` from `GET /lab/client`. That is also why `nginx/seatwave/status.conf` allows `10.209.9.0/24`.
 
 ## Try it yourself
 

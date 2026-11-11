@@ -10,19 +10,19 @@ The tests here check the outage probe, the access-log reader and Module 5's curl
 
 The three tools turn raw observations into numbers that go into the module's text: the length of an outage, the share of cache hits, the dominant phase of a request. Each test below pins one rule of that arithmetic to an exact value. A quiet error in a rule (for example an off-by-one in a median) would change the numbers in the README without any error message, and a test is the only thing that can notice.
 
-The tests of this part are 28 of the 119 in the README's count: `ProbeCliTest` 2, `TimelineTest` 4, `LogStatsTest` 4, `CurlLineTest` 7, `TimingReportTest` 4, `PhaseTimingsTest` 5 and `ReportCliTest` 2 (the writer's count from the Gradle result files). With the 24 tests of part 1, the five packages have 52.
+The tests of this part are 33 of the 166 in the README's count: `ProbeCliTest` 5, `TimelineTest` 5, `LogStatsTest` 4, `CurlLineTest` 7, `TimingReportTest` 4, `PhaseTimingsTest` 5 and `ReportCliTest` 3 (counted from the Gradle result files). With the 36 tests of part 1, the five packages have 69.
 
 ## Where it appears
 
 | File | What it checks |
 |---|---|
-| `probe/ProbeCliTest.java` | The request loop against a live and a dead address; the refusal of a bad settings file. |
+| `probe/ProbeCliTest.java` | The request loop against a live and a dead address; an answer that is not TLS and a silent server over TLS; a silent server and a closing server over plain HTTP; the command's printed timeline; the refusal of a bad settings file. |
 | `probe/TimelineTest.java` | Grouping into spans, the outage length, the printed text, the guards of `Span` and `Outcome`. |
 | `logs/LogStatsTest.java` | Parsing of log lines, the table of numbers per port, the command's exit statuses. |
 | `report/CurlLineTest.java` | Turning a curl line into phases; the zero rule; every refusal. |
 | `report/TimingReportTest.java` | The median run of a row, the table text, the guards. |
 | `report/PhaseTimingsTest.java` | The invariant: no negative phase, phases add up; the tie rule of `dominant`. |
-| `report/ReportCliTest.java` | The command: a good file, bad usage, a missing file, too few runs. |
+| `report/ReportCliTest.java` | The command: a good file, a refused line, bad usage, a missing file, too few runs. |
 
 ## How it works underneath
 
@@ -46,14 +46,24 @@ package io.plainround.seatwave.proxy.probe;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.plainround.seatwave.proxy.backend.TestBackend;
+import io.plainround.seatwave.proxy.tls.TlsFiles;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.PrintStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
 import java.net.URI;
+import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 ```
@@ -61,68 +71,217 @@ import org.junit.jupiter.api.io.TempDir;
 - Imports: `TestBackend` (a SeatWave on a free port, from the backend tests), the in-memory streams, `URI`, the file helpers, `Duration`, `List`, and the JUnit annotations.
 
 ```java
+
 class ProbeCliTest {
 
   @Test
   void recordsOneOutcomePerIntervalAndTellsSuccessFromFailure() throws Exception {
     try (TestBackend backend = TestBackend.untrusting()) {
-      ProbeSettings settings =
-          new ProbeSettings(
-              backend.plain("/health"),
-              TestBackend.TLS.resolve("seatwave-test-ca.pem"),
-              Duration.ofMillis(20),
-              Duration.ofMillis(200),
-              Duration.ofSeconds(1),
-              Duration.ofSeconds(1));
-      ProbeSettings refused =
-          new ProbeSettings(
-              URI.create("http://127.0.0.1:1/health"),
-              settings.authorityPem(),
-              Duration.ofMillis(20),
-              Duration.ofMillis(60),
-              Duration.ofSeconds(1),
-              Duration.ofSeconds(1));
+      // 200 ms at one request every 20 ms: the schedule sends exactly 10, however long each takes.
+      ProbeSettings settings = settings(backend.plain("/health"), Duration.ofMillis(200));
+
+      List<Outcome> ok = ProbeCli.probe(TestBackend.client(), settings);
+      List<Outcome> down =
+          ProbeCli.probe(TestBackend.client(), settings(closedPort("http"), Duration.ofMillis(60)));
+
+      assertThat(ok).hasSize(10).allMatch(Outcome::isSuccess);
+      assertThat(down)
+          .hasSize(3)
+          .allMatch(outcome -> outcome.result().equals("connection refused"));
+    }
+  }
 
 ```
 
-- The first test builds two sets of settings in code. `settings` points at the live backend's `/health` (plain HTTP), the TEST authority file, an interval of 20 ms, a duration of 200 ms, and 1-second timeouts. `refused` points at `http://127.0.0.1:1/health`: port 1 on this machine, where nothing normally listens, with a duration of 60 ms.
-- `try (TestBackend backend = TestBackend.untrusting())` starts the server and stops it at the end of the block.
+- The first test probes two addresses with `settings(uri, duration)` (below): an interval of 20 ms, the TEST authority file and 1-second timeouts. `try (TestBackend backend = TestBackend.untrusting())` starts a SeatWave and stops it at the end of the block.
+- For the live backend's `/health` over 200 ms: exactly 10 outcomes, all successes. The comment says why exactly 10 is safe: the loop counts planned send times (0, 20, ... 180 ms), not answers, however long each request takes. (The first version allowed 5 to 11, much wider than needed.)
+- For a closed port over 60 ms: exactly 3 outcomes, each `connection refused`. `closedPort` (below) gives a port that nothing listens on. The first version used port 1, which it assumed was closed on every machine.
 
 ```java
-      List<Outcome> ok = ProbeCli.probe(TestBackend.client(), settings);
-      List<Outcome> down = ProbeCli.probe(TestBackend.client(), refused);
+  @Test
+  void namesAnAnswerThatIsNotTlsAndATlsHandshakeWithNoAnswer() throws Exception {
+    // Closed in reverse order: the server sockets first, which ends the accepting tasks.
+    try (ExecutorService accepting = Executors.newVirtualThreadPerTaskExecutor();
+        ServerSocket plainText = new ServerSocket(0, 8, InetAddress.getLoopbackAddress());
+        ServerSocket silent = new ServerSocket(0, 8, InetAddress.getLoopbackAddress())) {
+      // A server that answers at once, but in plain HTTP, not with a TLS handshake.
+      accepting.submit(() -> answerInPlainText(plainText));
+      URI wrongProtocol = URI.create("https://127.0.0.1:" + plainText.getLocalPort() + "/health");
+      // A server that accepts the connection and never says a word.
+      accepting.submit(() -> holdOpen(silent));
+      URI mute = URI.create("https://127.0.0.1:" + silent.getLocalPort() + "/health");
 
-      assertThat(ok).hasSizeBetween(5, 11).allMatch(Outcome::isSuccess);
-      assertThat(down)
-          .isNotEmpty()
-          .allMatch(outcome -> outcome.result().equals("connection refused"));
+      List<Outcome> wrongPort =
+          ProbeCli.probe(TestBackend.client(), settings(wrongProtocol, Duration.ofMillis(20)));
+      List<Outcome> noAnswer =
+          ProbeCli.probe(quickConnectClient(), settings(mute, Duration.ofMillis(20)));
+
+      assertThat(wrongPort).extracting(Outcome::result).containsOnly("TLS failed");
+      assertThat(noAnswer).extracting(Outcome::result).containsOnly("connect or TLS timeout");
     }
   }
 ```
 
-- `ProbeCli.probe(TestBackend.client(), settings)` runs the loop and returns the outcomes. For the live backend: `hasSizeBetween(5, 11)` and `allMatch(Outcome::isSuccess)`. For the dead address: at least one outcome (`isNotEmpty()`) and every result text equals `connection refused`.
-- A 200 ms probe at a 20 ms interval always sends exactly 10 requests (the loop count depends on the planned send times only). The range 5 to 11 is much wider than needed.
-- The test depends on port 1 being closed. On a machine that listens on port 1, the second check would fail.
-- Only `connection refused` is checked. The texts `connect timeout`, `request timeout` and `connection lost` are produced by lines that no test runs.
+- **Two TLS failures.** The comment explains the order of the resources: they close from the last to the first, so the two server sockets close before the executor, which then finds its accepting tasks finished.
+- `plainText` answers at once, but in plain HTTP (`answerInPlainText`, below). A TLS client cannot read that, so every outcome must be `TLS failed`.
+- `silent` accepts every connection and never sends a byte (`holdOpen`, below). The client's connect timeout covers the TLS handshake, so the outcome must be `connect or TLS timeout`. `quickConnectClient()` (below) has a connect timeout of 200 ms, so the test is quick.
+- `extracting(Outcome::result).containsOnly(...)` takes the result text out of every outcome and requires that text and no other. With a 20 ms probe, there is one outcome in each list.
+
+```java
+  @Test
+  void namesAnAnswerThatNeverComesAndAConnectionClosedUnderTheRequest() throws Exception {
+    // Closed in reverse order: the server sockets first, which ends the accepting tasks.
+    try (ExecutorService accepting = Executors.newVirtualThreadPerTaskExecutor();
+        ServerSocket silent = new ServerSocket(0, 8, InetAddress.getLoopbackAddress());
+        ServerSocket closing = new ServerSocket(0, 8, InetAddress.getLoopbackAddress())) {
+      accepting.submit(() -> holdOpen(silent));
+      accepting.submit(() -> closeAtOnce(closing));
+      ProbeSettings slowAnswer =
+          new ProbeSettings(
+              URI.create("http://127.0.0.1:" + silent.getLocalPort() + "/health"),
+              TestBackend.TLS.resolve("seatwave-test-ca.pem"),
+              Duration.ofMillis(20),
+              Duration.ofMillis(20),
+              Duration.ofSeconds(1),
+              Duration.ofMillis(200));
+      URI cutOff = URI.create("http://127.0.0.1:" + closing.getLocalPort() + "/health");
+
+      List<Outcome> noAnswer = ProbeCli.probe(TestBackend.client(), slowAnswer);
+      List<Outcome> closed =
+          ProbeCli.probe(TestBackend.client(), settings(cutOff, Duration.ofMillis(20)));
+
+      assertThat(noAnswer).extracting(Outcome::result).containsOnly("request timeout");
+      assertThat(closed).extracting(Outcome::result).containsOnly("connection lost");
+    }
+  }
+```
+
+- **Two failures after the connection is up.** `silent` accepts every connection over plain HTTP and never answers (`holdOpen`, below); its settings give a request timeout of 200 ms, so the one outcome must be `request timeout`. `closing` reads the request and closes the connection without a word (`closeAtOnce`, below), so the outcome must be `connection lost`: the client's `IOException` that is neither a timeout, a refusal nor a TLS failure.
+- The two server sockets are declared after the executor, so they close first and end its accepting tasks, as in the test above.
+
+```java
+
+  @Test
+  void printsTheTimelineOfAShortProbeWithItsLengthInMilliseconds() throws Exception {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    PrintStream printer = new PrintStream(out, true, StandardCharsets.UTF_8);
+    int status;
+    try (TestBackend backend = TestBackend.untrusting()) {
+      ProbeSettings settings =
+          new ProbeSettings(
+              backend.plain("/health"),
+              TestBackend.TLS.resolve("seatwave-test-ca.pem"),
+              Duration.ofMillis(100),
+              Duration.ofMillis(500),
+              Duration.ofSeconds(1),
+              Duration.ofSeconds(1));
+      status = ProbeCli.probeAndPrint(settings, printer, printer);
+    }
+
+    assertThat(status).isZero();
+    assertThat(out.toString(StandardCharsets.UTF_8))
+        .contains("every 100 ms for 500 ms, one client")
+        .contains("200                    x    5")
+        .contains("outage: none, every request succeeded");
+  }
+```
+
+- **The command's own output.** `ProbeCli.probeAndPrint` runs a probe of 500 ms at 100 ms against the live backend and prints the timeline. The status must be 0, the first line must say `every 100 ms for 500 ms` (the first version printed `for 0 s` for such a probe), the span line must count 5 successes, and the last line must be `outage: none, every request succeeded`.
+
+```java
+  private static ProbeSettings settings(URI uri, Duration duration) {
+    return new ProbeSettings(
+        uri,
+        TestBackend.TLS.resolve("seatwave-test-ca.pem"),
+        Duration.ofMillis(20),
+        duration,
+        Duration.ofSeconds(1),
+        Duration.ofSeconds(1));
+  }
+
+  private static URI closedPort(String scheme) throws IOException {
+    // A port this machine handed out and took back: nothing listens on it now.
+    try (ServerSocket gone = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+      return URI.create(scheme + "://127.0.0.1:" + gone.getLocalPort() + "/health");
+    }
+  }
+
+  private static HttpClient quickConnectClient() throws IOException {
+    // A connect timeout of 200 ms, so the silent server's handshake gives up quickly.
+    return HttpClient.newBuilder()
+        .version(HttpClient.Version.HTTP_1_1)
+        .sslContext(TlsFiles.clientContext(TestBackend.TLS.resolve("seatwave-test-ca.pem")))
+        .connectTimeout(Duration.ofMillis(200))
+        .build();
+  }
+
+  private static Void answerInPlainText(ServerSocket server) throws IOException {
+    while (!server.isClosed()) {
+      try (Socket client = server.accept()) {
+        client
+            .getOutputStream()
+            .write("HTTP/1.1 400 Bad Request\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+      } catch (SocketException closed) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  private static Void holdOpen(ServerSocket server) throws IOException, InterruptedException {
+    List<Socket> held = new ArrayList<>();
+    try {
+      while (!server.isClosed()) {
+        held.add(server.accept());
+      }
+    } catch (SocketException closed) {
+      // The test closed the server: the run is over.
+    } finally {
+      for (Socket socket : held) {
+        socket.close();
+      }
+    }
+    return null;
+  }
+```
+
+- `settings(uri, duration)` builds the probe settings in code, so a test can aim at an address the settings file would refuse.
+- `closedPort(scheme)` asks the system for a free port (`new ServerSocket(0, ...)`), notes it and closes the socket at once. Nothing listens there afterwards, so a connection is refused. The comment says so.
+- `quickConnectClient()` is an `HttpClient` like the probe's, with a 200 ms connect timeout.
+- `answerInPlainText(server)` accepts each connection, writes `HTTP/1.1 400 Bad Request` and a blank line, and closes it. Closing the server makes `accept` throw `SocketException`, which ends the loop.
+```java
+  private static Void closeAtOnce(ServerSocket server) throws IOException {
+    // Accepts each connection, reads the request and closes without a word.
+    while (!server.isClosed()) {
+      try (Socket client = server.accept()) {
+        client.getInputStream().read(new byte[1_024]);
+      } catch (SocketException closed) {
+        return null;
+      }
+    }
+    return null;
+  }
+```
+
+- `closeAtOnce(server)` accepts each connection, reads up to 1,024 bytes of its request, and lets the `try` block close it. The comment says what a client sees: no answer at all. Closing the server ends the loop as in `answerInPlainText`.
+
+- `holdOpen(server)` accepts connections and keeps every one open in a list, without writing anything, until the server is closed; then it closes them all in `finally`. The `catch` is the normal end, which the comment names.
 
 ```java
   @Test
   void refusesAnAddressOutsideTheLabAndBadUsage(@TempDir Path folder) throws Exception {
+    String original = Files.readString(Path.of("config/probe.properties"), StandardCharsets.UTF_8);
+    // The text replaced below must be there, or the test would check the repository's own file.
+    assertThat(original).contains("https://127.0.0.1:20900/health");
     Path file =
         Files.writeString(
             folder.resolve("probe.properties"),
-            Files.readString(Path.of("config/probe.properties"), StandardCharsets.UTF_8)
-                .replace("https://127.0.0.1:20900/health", "https://seatwave.example/health"),
+            original.replace("https://127.0.0.1:20900/health", "https://seatwave.example/health"),
             StandardCharsets.UTF_8);
     ByteArrayOutputStream err = new ByteArrayOutputStream();
     PrintStream errors = new PrintStream(err, true, StandardCharsets.UTF_8);
     PrintStream out = new PrintStream(new ByteArrayOutputStream(), true, StandardCharsets.UTF_8);
 
-```
-
-- The second test reads the real `config/probe.properties`, replaces the address `https://127.0.0.1:20900/health` with `https://seatwave.example/health` (outside the lab), and writes the result to a temporary file. `err` is a byte buffer for the error output; `out` swallows the normal output.
-
-```java
     assertThat(ProbeCli.run(new String[] {file.toString()}, out, errors))
         .isEqualTo(ProbeCli.EXIT_BAD_USAGE);
     assertThat(ProbeCli.run(new String[0], out, errors)).isEqualTo(ProbeCli.EXIT_BAD_USAGE);
@@ -132,8 +291,8 @@ class ProbeCliTest {
 }
 ```
 
+- The last test reads the real `config/probe.properties`, first asserts that the address it will replace is there (if it were not, `replace` would do nothing, the file would stay valid, and the test would start a 30-second probe of the real stack address; the comment says why the check is there), then replaces `https://127.0.0.1:20900/health` with `https://seatwave.example/health` (outside the lab) and writes the result to a temporary file. `err` is a byte buffer for the error output; `out` swallows the normal output.
 - `ProbeCli.run` with the bad file and with no arguments must both return `EXIT_BAD_USAGE`. The error text must contain `probe.uri must match` and `usage: probe`.
-- If the address text in `config/probe.properties` changes, the `replace` does nothing and the file stays valid. The test would then start a 30-second probe against the real stack address and fail on the status, not on a clear message.
 
 ### `probe/TimelineTest.java`
 
@@ -186,7 +345,7 @@ class TimelineTest {
 ```
 
 - The outage of `OUTAGE`: first failure at 200 ms, first success after the last failure at 400 ms: 200 ms.
-- One success only: no outage (empty). A success then a failure (`502`) at the end: also empty, because service never came back inside the probe.
+- One success only: no outage (empty). A success then a failure (`502`) at the end: also empty, because service never came back inside the probe. `outage` itself still says only "no outage that ended"; the printed line tells the two cases apart (below).
 
 ```java
   @Test
@@ -200,13 +359,26 @@ class TimelineTest {
         .endsWith(
             "outage: 0.200 s from the first failed request to the first success after the last"
                 + System.lineSeparator());
-    assertThat(Timeline.render(List.of(outcome(0, "200", 1)))).contains("outage: none");
+  }
+
+  @Test
+  void tellsAProbeWithoutFailuresFromOneThatEndedInAnOutage() {
+    String clean = Timeline.render(List.of(outcome(0, "200", 1), outcome(100, "200", 1)));
+    String stillDown =
+        Timeline.render(
+            List.of(outcome(0, "connection refused", 1), outcome(100, "connection refused", 1)));
+
+    assertThat(clean).endsWith("outage: none, every request succeeded" + System.lineSeparator());
+    assertThat(stillDown)
+        .endsWith(
+            "outage: from 0.000 s to the end of the probe, with no success after it"
+                + System.lineSeparator());
   }
 ```
 
 - `render` must contain the exact first line: `  0.000 s to   0.100 s  200                    x    2  latency p50     3.00 ms, max     4.00 ms`. The two `200` outcomes have latencies 3 and 4 ms: the median of two is the lower one, 3, and the maximum is 4.
 - It must contain `connection refused     x    2`, and end with the outage line `outage: 0.200 s from the first failed request to the first success after the last` plus the system's line break.
-- For a history with no failure, the text must contain `outage: none`.
+- `tellsAProbeWithoutFailuresFromOneThatEndedInAnOutage`: a history of two successes must end with `outage: none, every request succeeded`, and a history of two refusals with `outage: from 0.000 s to the end of the probe, with no success after it`. The first version printed one text, `outage: none that ended inside the probe`, for both.
 
 ```java
   @Test
@@ -736,6 +908,33 @@ class ReportCliTest {
 
 ```java
   @Test
+  void stopsWithStatusOneAndNamesALineItRefused(@TempDir Path folder) throws Exception {
+    Path lines =
+        Files.write(
+            folder.resolve("timings.txt"),
+            java.util.List.of(
+                CurlLineTest.NEW_HTTPS,
+                CurlLineTest.NEW_HTTPS,
+                CurlLineTest.NEW_HTTPS,
+                "seatwave-https dns=not-a-number"),
+            StandardCharsets.UTF_8);
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    PrintStream printer = new PrintStream(out, true, StandardCharsets.UTF_8);
+
+    int status = ReportCli.run(new String[] {lines.toString()}, printer, printer);
+
+    assertThat(status).isEqualTo(ReportCli.EXIT_REFUSED_LINES);
+    assertThat(out.toString(StandardCharsets.UTF_8))
+        .contains("seatwave-https    new        HTTP/1.1     3")
+        .contains("dns=not-a-number");
+  }
+
+```
+
+- **A refused line.** Three good lines and one that `CurlLine` refuses (`dns=not-a-number`). The table is still printed for the three good ones, the refused line is named in the output, and the status is `EXIT_REFUSED_LINES` (1). This is the path from a refused line to the printed text at the level of the command, which no test ran in the first version. `java.util.List.of(...)` spells out the package because the file has no `import` for `List`.
+
+```java
+  @Test
   void refusesBadUsageAMissingFileAndTooFewRuns(@TempDir Path folder) throws Exception {
     Path one =
         Files.writeString(
@@ -759,22 +958,22 @@ class ReportCliTest {
 
 ### What these tests do not run
 
-From the JaCoCo report of the writer's run (lines that no test executes at all):
+From the JaCoCo report of a run of version 1.0.1 in a copy of the repository (lines that no test executes at all):
 
 | File | Lines | What they are |
 |---|---|---|
-| `probe/ProbeCli.java` | 39, 40 | `main`. |
-| | 61, 65 to 73, 75, 76, 78, 81 to 85 | The successful `run`: building the client, running the probe, printing the header line and the timeline. |
-| | 125 to 128 | The `catch` blocks for `HttpConnectTimeoutException` and `HttpTimeoutException`: the texts `connect timeout` and `request timeout`. |
-| | 131, 133 | The `catch` block for `IOException`: the text `connection lost`. |
-| `probe/ProbeSettings.java` | 61, 63 | The successful `from`. |
+| `probe/ProbeCli.java` | 40, 41 | `main`. |
+| | 62 | The hand-over from a settings file to `probeAndPrint`, which the tests call directly. |
+| | 84 to 86 | A certificate authority file that cannot be used. |
+| | 149 | The text `connect timeout` over plain HTTP. |
+| `probe/ProbeSettings.java` | 60, 62 | The successful `from`. |
 | `logs/LogStatsCli.java` | 31, 32, 65 | `main` and the `return 0` of a clean log. |
 | `logs/LogStats.java` | 68, 83 | The `-` for a port with no asked requests, and the empty-list guard of `percentile`. |
 | `report/CurlLine.java` | 79 | The `HTTP/3` case. |
 | `report/Runs.java` | 48 | `median(List<Duration>)`. |
-| `report/ReportCli.java` | 31, 32, 57, 58 | `main`, and the line that adds a problem to the list. |
+| `report/ReportCli.java` | 31, 32 | `main`. |
 
-Two of these matter. The texts of three of the probe's four outcomes are not tested, yet the README's lab output (`request timeout`, `connection lost`, `connection refused`) depends on them. And `ReportCli.run` never meets a line that `CurlLine` refuses, so the path from a refused line to the printed `refused:` text is untested at the command level. `TimingReport` does test the text for a given problem.
+One of these matters: the probe's text `connect timeout` over plain HTTP is produced by a line no test runs, because a test would need an address that drops connection attempts instead of refusing them, and on the loopback address nothing drops. Every other text is tested (`connection refused`, `TLS failed`, `connect or TLS timeout`, `request timeout` and `connection lost` in `ProbeCliTest`), and so is a refused line at the level of `ReportCli` (above). Version 1.0.0 also left the successful run of the probe command and the TLS texts unrun.
 
 ## Try it yourself
 
@@ -786,11 +985,11 @@ All commands run in the repository folder. Times differ on every run. None needs
 ./gradlew test --tests 'io.plainround.seatwave.proxy.probe.*' --tests 'io.plainround.seatwave.proxy.logs.*' --tests 'io.plainround.seatwave.proxy.report.*'
 ```
 
-`BUILD SUCCESSFUL`. 28 tests.
+`BUILD SUCCESSFUL`. 32 tests in version 1.0.1.
 
 **2. Break a rule and watch the right test notice.** In a copy of the repository, open `src/main/java/io/plainround/seatwave/proxy/report/Runs.java` and change `(sorted.size() - 1) / 2` to `sorted.size() / 2`. Run `./gradlew test --tests '*TimingReportTest'`. Gradle prints `TimingReportTest > reportsTheMedianRunWhosePhasesStillSumToItsTotal() FAILED`, `org.opentest4j.AssertionFailedError at TimingReportTest.java:20` and `4 tests completed, 1 failed`: for four runs, the median index becomes 2 (8.013 ms) instead of 1 (7.500 ms). Change it back.
 
-**3. See the lines no test runs.** Run `./gradlew check`, open `build/reports/jacoco/test/html/io.plainround.seatwave.proxy.probe/ProbeCli.java.html` in a browser, and look at the red lines in `send`.
+**3. See the lines no test runs.** Run `./gradlew check`, open `build/reports/jacoco/test/html/io.plainround.seatwave.proxy.probe/ProbeCli.java.html` in a browser, and look at the red lines in `send`: the `request timeout` and `connection lost` texts.
 
 **4. Check the tests are not flaky.** Run the probe tests five times in a row:
 
@@ -802,10 +1001,10 @@ With `-q` (quiet), Gradle prints nothing when the tests pass, so no output means
 
 ## Mistakes people make
 
-- **Expecting one test to cover a whole tool.** The probe's texts for timeouts are untested while its refusal text is. Read the coverage report, then read the tests.
-- **Using a wide range as an assertion.** `hasSizeBetween(5, 11)` accepts a loop that is badly wrong. The loop sends exactly 10.
-- **Depending on an unused port.** `127.0.0.1:1` is closed on a normal computer, not on every computer.
-- **Replacing text in a file you do not own.** `refusesAnAddressOutsideTheLabAndBadUsage` replaces the address in `config/probe.properties`. If the address changes, the test stops proving what its name says.
+- **Expecting one test to cover a whole tool.** The probe's `request timeout` and `connection lost` texts are untested while its other texts are. Read the coverage report, then read the tests.
+- **Using a wide range as an assertion.** Version 1.0.0's `hasSizeBetween(5, 11)` accepted a loop that was badly wrong. The loop sends exactly 10, and the test now says so.
+- **Depending on an unused port.** `127.0.0.1:1` is closed on a normal computer, not on every computer. Ask the system for a free port and close it, as `closedPort` does.
+- **Replacing text in a file you do not own.** `refusesAnAddressOutsideTheLabAndBadUsage` replaces the address in `config/probe.properties`. If the address changed, the replace would do nothing, so the test first asserts the address is there.
 - **Comparing floating-point numbers with `isEqualTo`.** The tests here compare texts and `Duration` values, which are exact. A `double` such as `0.1 + 0.2` is not `0.3`.
 - **Using the same data everywhere.** Several tests reuse `NEW_HTTPS`. A mistake in that constant would show in many tests at once, which is useful; but it also means that all of them test the same shape of line.
 
@@ -815,7 +1014,7 @@ With `-q` (quiet), Gradle prints nothing when the tests pass, so no output means
 2. For the history `200, 200, refused, refused, 200` at 0 to 400 ms, what is the outage and why? (200 ms: from the first failure at 200 ms to the first success after the last failure at 400 ms.)
 3. In `LogStatsTest`, why does the retried line have an upstream time of 2 ms? (The log lists one time per attempt, 0.001 and 0.001, and the parser adds them.)
 4. Which rule does `refusesANegativePhaseEvenWhenTheSumIsRight` protect? (A negative phase is refused even when the phases still add up to the total.)
-5. Name a text the probe can print that no test checks. (`connect timeout`, `request timeout` or `connection lost`.)
+5. Name a text the probe can print that no test checks. (`request timeout`, `connection lost`, or `connect timeout` over plain HTTP.)
 
 ## Further reading
 

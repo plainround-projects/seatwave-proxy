@@ -76,7 +76,7 @@ http {
     access_log /var/log/nginx/seatwave/access.log seatwave;
 ```
 
-- Line 15 opens `http {`. Everything to the matching `}` on line 55 is HTTP configuration.
+- Line 15 opens `http {`. Everything to the matching `}` on line 62 is HTTP configuration.
 - Line 16, `include /etc/nginx/mime.types;`: a file that comes with the image and maps file name endings to content types (`.js` to `text/javascript`, for example). NGINX needs it to set `Content-Type` for files it serves itself. Here almost all answers come from SeatWave with their own content type.
 - Line 17, `default_type application/octet-stream;`: the type for a file whose ending is not in that list ("unknown bytes").
 - Line 18, `server_tokens off;`: do not put the NGINX version in the `Server` header or on error pages. The header reads just `server: nginx` (I saw it in the responses).
@@ -141,6 +141,13 @@ time=2026-11-11T05:40:14+00:00 port=8443 status=200 us=200 rt=0.001 urt=0.001 uc
     proxy_cache_path /var/cache/nginx/seatwave levels=1:2 keys_zone=seatwave_static:10m
                      max_size=100m inactive=10m use_temp_path=off;
 
+    # The client's address as RFC 7239 writes a node in Forwarded (seatwave/proxy-headers.conf): an
+    # IPv6 address in brackets, so its colons cannot be read as a port; an IPv4 address as it is.
+    map $remote_addr $forwarded_node {
+        ~:      "[$remote_addr]";
+        default $remote_addr;
+    }
+
     include seatwave/upstreams.conf;
     include seatwave/production.conf;
     include seatwave/labs.conf;
@@ -156,7 +163,8 @@ time=2026-11-11T05:40:14+00:00 port=8443 status=200 us=200 rt=0.001 urt=0.001 uc
   - `max_size=100m`: when the cached files exceed this, the **cache manager** process removes the least recently used ones.
   - `inactive=10m`: a file not asked for in 10 minutes is removed, whatever its freshness.
   - `use_temp_path=off`: write a new cache file directly into the cache folder instead of first into a temporary folder and then moving it.
-- Lines 51 to 54 include the four server files: `upstreams.conf` (a block that is not a server), then `production.conf`, `labs.conf` and `status.conf`. Line 55 closes `http`.
+- Lines 51 to 52 are a comment, and lines 53 to 56 are a `map` block. A **map** makes a new variable whose value depends on another one, looked up for each request: `map $remote_addr $forwarded_node { ... }` sets `$forwarded_node` from the client's address. Each line inside is a pattern and a value. `~:` is a regular expression (the `~`) that matches any text containing a colon, which only an IPv6 address has; its value is `"[$remote_addr]"`, the address in square brackets. `default $remote_addr;` is the value when no pattern matched: an IPv4 address as it is. RFC 7239 requires the brackets in the `Forwarded` header, because an IPv6 address is full of colons and a node may end in `:port`; without them a reader cannot tell where the address ends. The lab network is IPv4, so the brackets were never needed here; the review pass checked the map in a throwaway NGINX inside the proxy's container, fed the address through a header because the containers have no IPv6, and it printed `for="[2001:db8::17]"` and `for="203.0.113.7"`. A `map` must sit in the `http` block, which is why it is here and not in `proxy-headers.conf`.
+- Lines 58 to 61 include the four server files: `upstreams.conf` (a block that is not a server), then `production.conf`, `labs.conf` and `status.conf`. Line 62 closes `http`.
 
 ### `nginx/seatwave/upstreams.conf`
 
@@ -329,9 +337,9 @@ proxy_set_header Host $host;
 # client sent is dropped and replaced with the address the proxy really saw.
 proxy_set_header X-Forwarded-For $remote_addr;
 proxy_set_header X-Forwarded-Proto $scheme;
-# RFC 7239's standard form of the same facts. The lab network is IPv4; an IPv6 client address
-# would have to be written in quotes and brackets.
-proxy_set_header Forwarded "for=$remote_addr;proto=$scheme";
+# RFC 7239's standard form of the same facts. The node is always quoted, and an IPv6 address is
+# also put in brackets by the map in nginx.conf, as the RFC requires (the lab network is IPv4).
+proxy_set_header Forwarded "for=\"$forwarded_node\";proto=$scheme";
 proxy_set_header X-Request-Id $request_id;
 # SeatWave never compresses; the proxy does, once, after the cache, so one cached copy serves
 # clients that accept gzip and clients that do not.
@@ -344,7 +352,7 @@ proxy_set_header Accept-Encoding "";
 - Line 7, `proxy_set_header Host $host;`: pass on the host name the client asked for. The default would be the upstream's name.
 - Lines 8 to 9 are a comment, and line 10, `proxy_set_header X-Forwarded-For $remote_addr;`: tell SeatWave the client's address. The value is **overwritten, never appended**. Whatever `X-Forwarded-For` a client sent is dropped and replaced with the address the proxy really saw. (The usual shortcut, `$proxy_add_x_forwarded_for`, appends and so would let a client forge a first entry. `NginxConfigRulesTest` fails if that variable appears.)
 - Line 11, `proxy_set_header X-Forwarded-Proto $scheme;`: whether the client used `http` or `https`, since SeatWave itself sees plain HTTP.
-- Lines 12 to 13 are a comment, and line 14, `proxy_set_header Forwarded "for=$remote_addr;proto=$scheme";`: RFC 7239's standard header with the same two facts. An IPv6 address would have to be quoted and put in brackets, which this IPv4 lab does not need.
+- Lines 12 to 13 are a comment, and line 14, `proxy_set_header Forwarded "for=\"$forwarded_node\";proto=$scheme";`: RFC 7239's standard header with the same two facts. Inside an NGINX string in double quotes, `\"` is a double quote that belongs to the value, so SeatWave receives `for="10.209.9.1";proto=https`. The quotes are allowed for every address and required for an IPv6 one, which `$forwarded_node` (the `map` in `nginx.conf`) also puts in brackets: `for="[2001:db8::17]"`. The first version wrote `for=$remote_addr` without quotes or brackets, which is wrong for an IPv6 client; SeatWave also refuses an address it would have to guess at (`java-forwarded-walkthrough.md`).
 - Line 15, `proxy_set_header X-Request-Id $request_id;`: the request's random identifier, so a line in the proxy's log and a line in SeatWave's log can be matched.
 - Lines 16 to 17 are a comment, and line 18, `proxy_set_header Accept-Encoding "";`: remove the client's `Accept-Encoding` before asking SeatWave. SeatWave never compresses; the proxy compresses, once, after the cache, so one cached copy serves clients that accept gzip and clients that do not.
 
@@ -424,11 +432,11 @@ server {
 - Lines 24 to 28: `location /`: every path that no other location claims. It includes the forwarded headers and the timeouts, then `proxy_pass http://seatwave;` sends the request to the upstream. There is no `proxy_cache_valid` here, so only what SeatWave allows by its own headers can be cached. The seat map says `Cache-Control: no-cache`, so it stays `MISS`; I asked twice and got `MISS` and `MISS`.
 
 ```nginx
-    # Posters and scripts: a fixed lifetime of 300 s, used when SeatWave sends none of its own.
+    # Posters and scripts. Their lifetime is SeatWave's own Cache-Control: public, max-age=300,
+    # which NGINX obeys; no proxy_cache_valid is set, so nothing here can keep a file longer.
     location /static/ {
         include seatwave/proxy-headers.conf;
         include seatwave/timeouts.conf;
-        proxy_cache_valid 200 300s;
         # One request fills a missing entry while the others wait for it, instead of all asking
         # SeatWave. Only here: on a path SeatWave never lets the proxy cache, such as the seat
         # map, every request would wait for the one before it (Section 9 measures it).
@@ -437,9 +445,8 @@ server {
     }
 ```
 
-- Line 30 is a comment: posters and scripts get a fixed lifetime of 300 s, used when SeatWave sends none of its own.
-- Line 31, `location /static/ {`: every path that starts with `/static/`.
-- Line 34, `proxy_cache_valid 200 300s;`: cache a response with status 200 for 300 s. This applies only if SeatWave's reply has no `Cache-Control` or `Expires` header of its own. (SeatWave does send `Cache-Control: public, max-age=300`. A throwaway test server without this line cached `/static/seat-map.js` just the same, so here the line is a fallback that is not needed today.)
+- Lines 30 to 31 are a comment: the lifetime of a poster or script is SeatWave's own `Cache-Control: public, max-age=300`, which NGINX obeys, and no `proxy_cache_valid` is set, so the proxy cannot keep a file longer than SeatWave allows. (`proxy_cache_valid` gives a lifetime to replies that carry none. The first version set `proxy_cache_valid 200 300s;` here as a fallback, but SeatWave always sends its header, and a header's lifetime takes priority, so the line never did anything and was removed.)
+- Line 32, `location /static/ {`: every path that starts with `/static/`.
 - Lines 35 to 37 are a comment, and line 38, `proxy_cache_lock on;`: when many requests arrive for a missing entry, one goes to SeatWave and the others wait for the answer, instead of all asking SeatWave. It is only here: on a path SeatWave never lets the proxy cache, every request would wait for the one before it. Lab 20914 sets it for the whole server to show that cost.
 
 ```nginx
@@ -460,6 +467,7 @@ server {
 - Lines 43 to 45: the forwarded headers, then the timeouts set here by hand instead of including `timeouts.conf`: connect 2 s, send 5 s.
 - Lines 46 to 47 are a comment: the long poll is held 25 s and the stream sends a heartbeat every 15 s, so `proxy_read_timeout 30s;` (line 48) sits above both. With the 2.5 s of `timeouts.conf` the proxy would cut the poll off (lab 20905).
 - Line 49, `proxy_buffering off;`: pass each piece to the client as it arrives, so an event never waits in a buffer.
+- This location sets no cache directive of its own, so it inherits the server's `proxy_cache seatwave_static;` and `add_header X-Cache-Status ...` (lines 17 and 22). Nothing is kept, because SeatWave answers both the long poll and the stream with `Cache-Control: no-store`, and NGINX does not cache a reply it reads unbuffered. The review pass checked it on the running stack: the long poll's answer carried `cache-control: no-store` and `x-cache-status: MISS`, and so did the stream's.
 - Line 50, `proxy_pass http://seatwave;`, and the closing braces on lines 51 and 52 end the location and the server.
 
 ## Try it yourself
@@ -493,6 +501,8 @@ content-length: 3703
 cache-control: public, max-age=300
 x-cache-status: HIT
 ```
+
+This run used version 1.0.0, whose script was 3,703 bytes; version 1.0.1's is 4,392 bytes, and the headers are otherwise the same.
 
 3. A body over the limit:
 

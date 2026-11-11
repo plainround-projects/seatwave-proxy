@@ -97,7 +97,9 @@ import java.util.Objects;
  * @param upstreamStatus the status SeatWave sent, or 0 when SeatWave was not asked (a cache hit)
  * @param requestTime from the first byte of the request to the last byte of the response
  * @param upstreamTime SeatWave's part of it, or {@link Duration#ZERO} when SeatWave was not asked
- * @param cacheStatus {@code HIT}, {@code MISS}, {@code BYPASS} and so on, or an empty string
+ * @param cacheStatus NGINX's {@code $upstream_cache_status}: {@code MISS}, {@code BYPASS}, {@code
+ *     EXPIRED}, {@code STALE}, {@code UPDATING}, {@code REVALIDATED} or {@code HIT}, or an empty
+ *     string when the location has no cache
  * @param askedUpstream whether the proxy sent the request on to SeatWave
  * @param uri the request's path
  */
@@ -112,7 +114,7 @@ public record AccessLine(
     String uri) {
 ```
 
-- The record has eight components, documented in the Javadoc: `port`, `status`, `upstreamStatus` (0 when SeatWave was not asked), `requestTime`, `upstreamTime` (zero when not asked), `cacheStatus` (an empty text when the cache was not used), `askedUpstream` and `uri`.
+- The record has eight components, documented in the Javadoc: `port`, `status`, `upstreamStatus` (0 when SeatWave was not asked), `requestTime`, `upstreamTime` (zero when not asked), `cacheStatus` (one of the seven values NGINX's `$upstream_cache_status` can take, which the Javadoc names: `MISS`, `BYPASS`, `EXPIRED`, `STALE`, `UPDATING`, `REVALIDATED`, `HIT`; or an empty text when the location has no cache), `askedUpstream` and `uri`.
 - A cache `HIT` has no upstream, so `upstreamStatus` is 0 and `askedUpstream` is false.
 
 ```java

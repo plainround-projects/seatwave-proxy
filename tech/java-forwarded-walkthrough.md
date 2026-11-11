@@ -8,7 +8,7 @@ That is harder than it sounds once a proxy sits in front of the server. A **reve
 
 - `X-Forwarded-For`: a comma-separated list of client addresses, oldest hop first. Example: `203.0.113.7, 10.209.9.10`.
 - `X-Forwarded-Proto`: `http` or `https`, how the client reached the proxy.
-- `Forwarded`: the standard form of both (RFC 7239). Example: `for=203.0.113.7;proto=https`. IPv6 addresses are written in square brackets and quotes: `for="[2001:db8:cafe::17]:4711"`.
+- `Forwarded`: the standard form of both (RFC 7239). Example: `for=203.0.113.7;proto=https`, or with quotes, as this repository's proxy writes it, `for="203.0.113.7";proto=https`. IPv6 addresses must be written in square brackets and quotes: `for="[2001:db8:cafe::17]:4711"`.
 
 The trap: **any client can write these headers itself.** If SeatWave believed `X-Forwarded-For` from everybody, a client could say it is any address it likes, and defeat limits, logs and blocks that depend on the client address. This package is the rule that prevents that.
 
@@ -48,7 +48,7 @@ Example with trusted `10.209.9.10` and `127.0.0.1`, peer `127.0.0.1`, header `19
 
 **Limits.** At most 16 hops (`MAX_HOPS`) and at most 1,024 characters per header line (`MAX_HEADER_CHARACTERS`). A longer chain is not a real path; it is an attack, so it is `UNREADABLE`.
 
-**No name lookups.** Every address is parsed as a literal with `InetAddress.ofLiteral`, which never asks DNS. A name in a header is refused instead of causing a lookup that an attacker chose.
+**No name lookups, no guessing.** Every address is parsed as a literal with `InetAddress.ofLiteral`, which never asks DNS. A name in a header is refused instead of causing a lookup that an attacker chose. The text must also be an address in its exact form: IPv4 as four decimal numbers joined by dots (a **dotted quad**, such as `203.0.113.7`), and IPv6 in brackets inside `Forwarded`. Anything that could be read as two different addresses is refused, never guessed.
 
 ## Walkthrough of this repository's use
 
@@ -171,6 +171,7 @@ import java.net.InetAddress;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 ```
 
@@ -216,12 +217,13 @@ The constructor copies the set (`Set.copyOf`) and refuses an empty one: a truste
     Objects.requireNonNull(literals, "literals");
     Set<InetAddress> parsed = new LinkedHashSet<>();
     for (String literal : literals) {
-      try {
-        // ofLiteral never consults DNS: a name here is refused, not resolved.
-        parsed.add(InetAddress.ofLiteral(literal));
-      } catch (IllegalArgumentException notAnAddress) {
+      // The same strict rule as the forwarded hops: never a name, never DNS, and no short IPv4
+      // form that would trust another address than the one written.
+      Optional<InetAddress> address = ClientAddress.literal(literal);
+      if (address.isEmpty()) {
         return Result.error("a trusted proxy must be an IP address, but was '" + literal + "'");
       }
+      parsed.add(address.get());
     }
     if (parsed.isEmpty()) {
       return Result.error("at least one trusted proxy address is needed");
@@ -230,7 +232,7 @@ The constructor copies the set (`Set.copyOf`) and refuses an empty one: a truste
   }
 ```
 
-`parse` turns the text from the settings file into the record. It loops over the items and tries `InetAddress.ofLiteral(literal)` for each; a name or any other text throws `IllegalArgumentException`, which is turned into an error value (`Result.error`, see `result4j.md`) that quotes the bad item. `LinkedHashSet` keeps the order of insertion. An empty list is an error too. The returned type is `Result<TrustedProxies, String>`: either the record or a reason.
+`parse` turns the text from the settings file into the record. It loops over the items and asks `ClientAddress.literal(literal)` (below) for each: an `Optional` that is empty for a name, any other text, or a short IPv4 form. An empty one is turned into an error value (`Result.error`, see `result4j.md`) that quotes the bad item. The comment gives the reason for using the same rule as the headers: `127.0.1` in the settings file must be refused, not read as `127.0.0.1`, or a typo would trust an address nobody wrote. `address.get()` takes the value out once `isEmpty()` has said there is one. `LinkedHashSet` keeps the order of insertion. An empty list is an error too. The returned type is `Result<TrustedProxies, String>`: either the record or a reason.
 
 ```java
   /**
@@ -289,10 +291,15 @@ The class comment is the module's invariant in words. The class is `final` with 
   /** The longest header line read; RFC 7239 values for 16 hops fit easily. */
   public static final int MAX_HEADER_CHARACTERS = 1_024;
 
+  // An IPv4 address as RFC 7239 and NGINX write it: four decimal parts. InetAddress.ofLiteral also
+  // takes the short forms of old BSD systems, so "127.1" or "2001" would quietly become another
+  // address (127.0.0.1, 0.0.7.209) instead of being refused.
+  private static final Pattern DOTTED_QUAD = Pattern.compile("[0-9]{1,3}(\\.[0-9]{1,3}){3}");
+
   private ClientAddress() {}
 ```
 
-The two limits, public so the tests can use them.
+The two limits, public so the tests can use them. `DOTTED_QUAD` is the shape an IPv4 address must have: `[0-9]{1,3}` is one to three digits, and `(\\.[0-9]{1,3}){3}` is a dot and one to three digits, three times. The comment says why the shape is checked before `ofLiteral`: the JDK also accepts the **short forms** of old BSD systems, where `127.1` means `127.0.0.1` and a single number such as `2001` means the address with that value (`0.0.7.209`). Nothing in this lab writes such a form, so one in a header is a mistake or a trick, and is refused.
 
 ```java
   /**
@@ -366,12 +373,15 @@ A trusted proxy that sends no forwarding header is making its own request, so th
         return Optional.of(new ClientView(hop.address(), scheme, source));
       }
     }
-    // Every hop is a trusted proxy: the request started inside the trusted path.
-    return Optional.of(new ClientView(hops.getFirst().address(), defaultScheme, source));
+    // Every hop is a trusted proxy: the request started inside the trusted path, at the first hop,
+    // and the scheme is the one that hop was reached with, when the header says it.
+    Hop first = hops.getFirst();
+    String scheme = first.scheme().isEmpty() ? defaultScheme : first.scheme();
+    return Optional.of(new ClientView(first.address(), scheme, source));
   }
 ```
 
-`fromHops` implements "right to left, skip trusted". An empty chain or one longer than 16 hops gives nothing. The `for` loop starts at the last index and counts down. For each hop: if it is not a trusted proxy, it is the client; the scheme is the hop's own if it said one, else the default; return at once. If the loop ends, every hop was a trusted proxy: the request started inside the trusted path, and the first hop is taken. One quirk, confirmed by running it: in that last case the scheme is `defaultScheme`, which for the `Forwarded` header is the listener's scheme, not the hop's `proto`. `Forwarded: for=10.209.9.10;proto=https` from a trusted proxy to the plain port is read as `http`, while the same chain in `X-Forwarded-For` plus `X-Forwarded-Proto: https` is read as `https`. The tests do not cover this case for `Forwarded`.
+`fromHops` implements "right to left, skip trusted". An empty chain or one longer than 16 hops gives nothing. The `for` loop starts at the last index and counts down. For each hop: if it is not a trusted proxy, it is the client; the scheme is the hop's own if it said one, else the default; return at once. If the loop ends, every hop was a trusted proxy: the request started inside the trusted path, and the first hop is taken, with that hop's own scheme if it said one, else the default. The first version always used `defaultScheme` here, which for the `Forwarded` header is the listener's scheme: `Forwarded: for=10.209.9.10;proto=https` from a trusted proxy to the plain port was read as `http`, while the same chain in `X-Forwarded-For` plus `X-Forwarded-Proto: https` was read as `https`. Now both give `https`, and `ClientAddressTest.takesTheFirstHopsProtoWhenEveryForwardedHopIsATrustedProxy` checks it.
 
 ```java
   private static Optional<List<Hop>> forwardedHops(List<String> lines) {
@@ -468,17 +478,44 @@ A trusted proxy that sends no forwarding header is making its own request, so th
     // RFC 7239 Section 6: an IPv6 node is in brackets, and any node may carry a port after a colon.
     if (node.startsWith("[")) {
       int closeAt = node.indexOf(']');
-      return closeAt < 0 ? Optional.empty() : literal(node.substring(1, closeAt));
+      if (closeAt < 0 || !node.substring(1, closeAt).contains(":")) {
+        return Optional.empty();
+      }
+      String rest = node.substring(closeAt + 1);
+      return rest.isEmpty() || rest.startsWith(":")
+          ? literal(node.substring(1, closeAt))
+          : Optional.empty();
     }
     int colonAt = node.indexOf(':');
-    return literal(colonAt < 0 ? node : node.substring(0, colonAt));
+    if (colonAt != node.lastIndexOf(':')) {
+      // An IPv6 address without its brackets: the address and a port cannot be told apart, so the
+      // node is refused instead of being cut at its first colon.
+      return Optional.empty();
+    }
+    String address = colonAt < 0 ? node : node.substring(0, colonAt);
+    return address.contains(":") ? Optional.empty() : literal(address);
   }
 ```
 
-`nodeAddress` reads the value of `for`. A node in square brackets is an IPv6 address: take what is between `[` and `]` (a missing `]` gives nothing). Otherwise cut at the first colon, if any, to drop a port, and parse the rest. Two things were confirmed by running it. First, an IPv6 address written without brackets, `for=2001:db8::1`, is cut at the first colon and read as `2001`, which the JDK parses as the IPv4 address `0.0.7.209`; the result is source `FORWARDED` with a wrong address instead of `UNREADABLE`. RFC 7239 requires brackets and quotes for IPv6, so a correct proxy never sends this; but the proxy configuration in `nginx/seatwave/proxy-headers.conf` writes `for=$remote_addr` without quotes, so an IPv6 client would trigger it. The lab publishes on IPv4 loopback only. Second, the JDK also accepts short IPv4 forms: `127.1` is read as `127.0.0.1`.
+`nodeAddress` reads the value of `for` (RFC 7239 calls it a **node**: an address, maybe followed by `:` and a port).
+
+- A node in square brackets must be an IPv6 address. What is between `[` and `]` must contain a colon (`[1.2.3.4]` is refused), and after `]` there may be nothing or a `:` and a port; anything else is refused. A missing `]` gives nothing.
+- A node without brackets may contain at most one colon, the one before a port. `colonAt != node.lastIndexOf(':')` means there are two or more, so this is an IPv6 address without its brackets (or a broken node such as `203.0.113.7:4711:80`), and the node is refused. The text before the one colon, or the whole node, must then be an IPv4 address.
+
+The first version cut every unbracketed node at its first colon. An IPv6 address written without brackets, `for=2001:db8::1`, became `2001`, which `ofLiteral` read as the IPv4 address `0.0.7.209`: a wrong client with the source `FORWARDED`, instead of `UNREADABLE`. The proxy's own header made it possible, because it wrote `for=$remote_addr` without quotes or brackets; it now writes `for="$forwarded_node"`, with brackets for IPv6 (`nginx-config-walkthrough-1.md`). Both ends are fixed, so either fix alone would stop the wrong address.
 
 ```java
-  private static Optional<InetAddress> literal(String text) {
+  /**
+   * Parses an IP address literal strictly: IPv4 only as four decimal parts, IPv6 as RFC 4291 writes
+   * it, and never a name.
+   *
+   * @param text the literal
+   * @return the address, or empty if the text is not one
+   */
+  static Optional<InetAddress> literal(String text) {
+    if (!text.contains(":") && !DOTTED_QUAD.matcher(text).matches()) {
+      return Optional.empty();
+    }
     try {
       // ofLiteral parses an address and never looks a name up, so "unknown" or a host name is
       // refused instead of sending a DNS query an attacker chose.
@@ -489,7 +526,7 @@ A trusted proxy that sends no forwarding header is making its own request, so th
   }
 ```
 
-`literal` parses an address with `InetAddress.ofLiteral`, which "never looks a name up", so `unknown` or a host name gives `IllegalArgumentException`, caught and turned into an empty `Optional`.
+`literal` is the strict rule for one address, used for the headers and, through `TrustedProxies.parse`, for the settings file; that is why it lost its `private` and is visible to the whole package. Text without a colon must be a dotted quad, or the answer is empty at once. Then `InetAddress.ofLiteral` parses it; it "never looks a name up", so `unknown` or a host name gives `IllegalArgumentException`, caught and turned into an empty `Optional`. An IPv6 address is written as RFC 4291 describes (the standard for IPv6 addresses), with colons, and needs no extra check.
 
 ```java
   private static String unquote(String value) {
@@ -546,12 +583,28 @@ curl -s -H 'Forwarded: for=127.0.0.1;proto=https' http://127.0.0.1:20931/lab/cli
 ```
 
 ```
-{"address":"127.0.0.1","scheme":"http","source":"forwarded"}
+{"address":"127.0.0.1","scheme":"https","source":"forwarded"}
 ```
 
-The scheme is `http` although the header said `https` (the quirk described above).
+The scheme is the `https` the header said. (Version 1.0.0 printed `http` here, the quirk described above.)
 
-**5. Run the unit tests.**
+**5. An address that would have to be guessed.**
+
+```
+curl -s -H 'Forwarded: for=2001:db8::1' http://127.0.0.1:20931/lab/client; echo
+curl -s -H 'X-Forwarded-For: 127.1' http://127.0.0.1:20931/lab/client; echo
+curl -s -H 'Forwarded: for="[2001:db8::17]:4711";proto=https' http://127.0.0.1:20931/lab/client; echo
+```
+
+```
+{"address":"127.0.0.1","scheme":"http","source":"unreadable"}
+{"address":"127.0.0.1","scheme":"http","source":"unreadable"}
+{"address":"2001:db8:0:0:0:0:0:17","scheme":"https","source":"forwarded"}
+```
+
+The IPv6 address without brackets and the short IPv4 form are both refused: the client is the trusted peer itself, with the source `unreadable`, and SeatWave's `seatwave_forwarding_headers_unreadable_total` counter grew by two. The bracketed address is read, and Java writes it in its long form.
+
+**6. Run the unit tests.**
 
 ```
 ./gradlew test --tests '*ClientAddressTest' --tests '*ForwardedInvariantTest'
@@ -567,7 +620,8 @@ They pass. To see an untrusted peer ignored, change `forwarded.trustedProxies` i
 - **Guessing on bad input.** An unreadable header from a trusted proxy is a configuration error to fix. The code answers with the proxy's own address, labels it `UNREADABLE`, and the server counts it.
 - **Unlimited chains.** The 16-hop and 1,024-character limits bound the work an attacker can cause.
 - **Two writers.** A scheme header sent on two lines is not believed.
-- **IPv6 without brackets.** Write `for="[2001:db8::1]"`. Without brackets this code reads a different address (see above).
+- **IPv6 without brackets.** Write `for="[2001:db8::1]"`. Without brackets a reader cannot tell the address from a port; this code refuses such a node, and the first version read a different address (see above).
+- **Accepting every form a parser accepts.** `InetAddress.ofLiteral` takes `127.1` as `127.0.0.1`. A security rule checks the exact shape first, so a form nobody meant is refused.
 
 ## Check yourself
 

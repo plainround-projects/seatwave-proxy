@@ -61,7 +61,7 @@ The repository is the hands-on project of Module 9, "Proxies", of a system desig
 | `toml-version-catalog.md` | `gradle/libs.versions.toml`, the one place for dependency versions. |
 | `dependency-locking.md` | `gradle.lockfile` and `settings-gradle.lockfile`, which pin exact versions of 30 jars. |
 | `spotless-google-java-format.md` | The formatter that the build enforces. |
-| `jacoco.md` | The line-coverage tool and its 80 percent floor; the real coverage is 91.8 percent. |
+| `jacoco.md` | The line-coverage tool and its 80 percent floor; the real coverage is 95.5 percent. |
 
 **The tests**
 
@@ -71,7 +71,7 @@ The repository is the hands-on project of Module 9, "Proxies", of a system desig
 | `assertj.md` | AssertJ: the fluent assertions used in the tests. |
 | `awaitility.md` | Awaitility: waiting for a condition, used once, to test overload. |
 | `tests-backend-walkthrough.md` | The tests of the `backend` package, line by line. |
-| `tests-forwarded-config-tls-walkthrough.md` | The tests of the `forwarded`, `config` and `tls` packages. |
+| `tests-forwarded-config-tls-walkthrough.md` | The tests of the `forwarded`, `config`, `json` and `tls` packages. |
 | `tests-tools-walkthrough-1.md` | The tests of the tools, part 1: the bench and the slow clients. |
 | `tests-tools-walkthrough-2.md` | The tests of the tools, part 2: the probe, the log reader and the curl report. |
 | `tests-stack-walkthrough.md` | The tests that read the NGINX and Compose files, and the tagged tests that run against the live stack. |
@@ -84,7 +84,7 @@ The repository is the hands-on project of Module 9, "Proxies", of a system desig
 | `git.md` | Git: `.gitignore` and `.gitattributes`. |
 | `gitleaks.md` | Gitleaks: the secret scanner that stands behind `.gitignore`; no file of the repository runs it. |
 
-Five long walkthroughs are split into two files each (`-1` and `-2`). A reference to the name without the number, such as `java-backend-walkthrough.md` in another note, means both parts.
+Five long walkthroughs are split into two files each (`-1` and `-2`), and every note names the part it means.
 
 ## Reading order
 
@@ -113,9 +113,9 @@ The notes of the build files and the libraries were checked on 11 November 2026 
 ./gradlew -q serve --args='config/backend-local.properties'
 ```
 
-`check` runs 119 tests with a line coverage of 91.8 percent (1,937 of 2,111 lines). `testCertificates` makes the throwaway test certificates in `build/tls`. `serve` starts SeatWave on 127.0.0.1 on ports 20930 to 20932 and runs until you stop it. The stack, the bench, the probe and the slow-client lab need Docker; the notes that describe them say whether their commands were run.
+`check` runs 166 tests with a line coverage of 95.5 percent (2,108 of 2,208 lines in the final run of version 1.0.1, the run the project's README quotes). `testCertificates` makes the throwaway test certificates in `build/tls`. `serve` starts SeatWave on 127.0.0.1 on ports 20930 to 20932 and runs until you stop it. The stack, the bench, the probe and the slow-client lab need Docker; the notes that describe them say whether their commands were run.
 
-One practical warning, found while writing these notes: keep the project in a folder with a short path. The settings readers accept a key store path of at most 200 characters, and the tests pass an absolute path, so a deep folder makes two tests fail (`java-properties.md`, section "Mistakes people make").
+One warning from version 1.0.0 no longer applies: its settings readers accepted a key store path of at most 200 characters, so a checkout in a deep folder, or in a folder with a space, failed two tests. Version 1.0.1 accepts any path without control characters (`java-config-json-tls-walkthrough.md`).
 
 ## How these notes were checked
 

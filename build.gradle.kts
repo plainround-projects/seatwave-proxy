@@ -186,7 +186,11 @@ tasks.test {
     dependsOn(testCertificates)
     systemProperty("seatwave.tls.directory", layout.buildDirectory.dir("tls").get().asFile.absolutePath)
     systemProperty("seatwave.nginx.directory", file("nginx").absolutePath)
+    // The configuration rules read these files too, so a change to any of them runs the tests again.
     inputs.dir("nginx")
+    inputs.dir("config")
+    inputs.file("compose.yaml")
+    inputs.file("Dockerfile")
     testLogging {
         events("passed", "failed", "skipped")
     }

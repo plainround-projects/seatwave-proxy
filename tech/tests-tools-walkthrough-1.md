@@ -12,19 +12,19 @@ The tests in this part check the load generator, its settings, the report table,
 
 The course rule is that a number printed by a tool must be trustworthy. A tool that measures a proxy can be wrong in many quiet ways: a percentile off by one, a byte count that includes the chunk framing, a median taken the wrong way. Each test below pins one such rule to an exact value, so a change that breaks the rule turns the build red. The tests also make the tools safe to change without the Docker stack: `./gradlew check` needs no Docker.
 
-The README's result is "119 tests, 0 failures, line coverage 91.8 percent (1,937 of 2,111 lines)". The writer of these notes ran the whole suite on a copy of the repository and got the same two numbers: 119 tests and 1,937 of 2,111 lines. The tests of this part are 24 of the 119: `ContainerCountersTest` 5, `BenchCliTest` 2, `LoadRunTest` 5, `BenchSettingsTest` 2, `RawResponseTest` 3, `BenchReportTest` 2, `SlowClientsTest` 5 (the writer's count from the Gradle result files).
+In a run of version 1.0.1 on a copy of the repository the whole suite had 166 tests, 0 failures, and covered 2,108 of 2,208 lines in the final run. The tests of this part are 36 of the 166: `ContainerCountersTest` 5, `BenchCliTest` 4, `LoadRunTest` 8, `BenchSettingsTest` 2, `RawResponseTest` 3, `BenchReportTest` 4, `SlowClientsTest` 10 (counted with `grep -c '@Test'` on each file).
 
 ## Where it appears
 
 | File | What it checks |
 |---|---|
 | `bench/ContainerCountersTest.java` | Parsing of `cpu.stat` and `/proc/net/snmp`; running a (fake) `docker`; counter arithmetic. |
-| `bench/BenchCliTest.java` | The exit statuses and messages of the bench command. |
-| `bench/LoadRunTest.java` | The load generator against a real SeatWave: reused connections, new connections, errors; the percentile rule; refused inputs. |
+| `bench/BenchCliTest.java` | The exit statuses and messages of the bench command; a whole run against an in-process SeatWave; a container that restarts during a run. |
+| `bench/LoadRunTest.java` | The load generator against a real SeatWave: reused connections, new connections, errors; cache hits; refused connections; the `Host` header; the percentile rule; refused inputs. |
 | `bench/BenchSettingsTest.java` | The real `config/bench.properties`, and refusal of a bad copy. |
 | `bench/RawResponseTest.java` | Chunked and gzip bodies, a body ended by the connection, cut-off answers. |
-| `bench/BenchReportTest.java` | The median run and the printed row; the refusal of fewer than three runs. |
-| `slow/SlowClientsTest.java` | Slow clients against a real SeatWave; failed downloads; the real settings files; the printed result. |
+| `bench/BenchReportTest.java` | The median run and the printed row; CPU per request sent; the two warning lines; the refusal of fewer than three runs. |
+| `slow/SlowClientsTest.java` | Slow clients against a real SeatWave; busy workers; small reads; downloads cut short; the completeness rule; the real settings files; the printed result. |
 
 Another test file, `backend/TestBackend.java`, is a helper that belongs to the backend tests (see `tests-backend-walkthrough.md`). These tests use five things from it: `TestBackend.untrusting()` starts a SeatWave on `127.0.0.1` on ports the system picks (8 worker threads, a queue of 64, quick slow routes) that trusts no forwarded address of this machine; `plain(path)`, `tls(path)` and `admin(path)` give addresses on its three listeners; `metrics()` reads its operations text; `TestBackend.TLS` is the folder with the TEST certificates; and `close()` stops it. A `TestBackend` is `AutoCloseable`, so `try (TestBackend backend = ...)` stops it at the end of the block.
 
@@ -63,6 +63,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 ```
 
@@ -115,6 +117,7 @@ class ContainerCountersTest {
 
 ```java
   @Test
+  @DisabledOnOs(value = OS.WINDOWS, disabledReason = "the stand-in for docker is a /bin/sh script")
   void runsTheCommandAsAListAndParsesWhatItPrints(@TempDir Path folder) throws Exception {
     Path fakeDocker = script(folder, "cat <<'END'\n" + SAMPLE + "END");
 
@@ -126,10 +129,11 @@ class ContainerCountersTest {
 
 - `runsTheCommandAsAListAndParsesWhatItPrints` tests `read`, with no Docker. `script(folder, body)` (below) writes an executable file called `docker` into the temporary folder. The body is `cat <<'END'` followed by the sample and `END`: a shell **here-document**, which makes `cat` print the text between the two markers. The quotes around `END` stop the shell from changing the text.
 - `new ContainerCounters(fakeDocker.toString())` uses the fake program's path as the "docker command", so the real `read` method starts a real process: `<fake> exec seatwave-proxy-proxy-1 cat /sys/... /proc/...`. The fake ignores its arguments and prints the sample. The result must equal the counters of the sample.
-- This is the only test that runs a program with `ProcessBuilder`. It uses `#!/bin/sh` and POSIX file permissions, so it runs on macOS and Linux but not on Windows.
+- The test starts a real program through `ProcessBuilder`. The program is a `#!/bin/sh` script with POSIX file permissions, which Windows does not have, so `@DisabledOnOs(value = OS.WINDOWS, disabledReason = ...)` skips the test there and says why, instead of letting it fail. The same holds for the next test and for two tests in `BenchCliTest`. On macOS and Linux they run.
 
 ```java
   @Test
+  @DisabledOnOs(value = OS.WINDOWS, disabledReason = "the stand-in for docker is a /bin/sh script")
   void reportsAFailedCommandAndRefusesANameThatIsNotAContainerName(@TempDir Path folder)
       throws Exception {
     Path failingDocker = script(folder, "echo 'No such container' >&2; exit 1");
@@ -179,13 +183,19 @@ package io.plainround.seatwave.proxy.bench;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.plainround.seatwave.proxy.backend.TestBackend;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Duration;
+import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 ```
 
@@ -240,24 +250,96 @@ class BenchCliTest {
 
 - The second test starts a bench run whose "docker" is a path that does not exist (`folder.resolve("no-docker")`). The `quickSettings` file is the repository's real settings with the warm-up set to 0. `BenchCli.run` therefore reaches the first container reading, which cannot start the program and throws `IOException`.
 - The status must be `EXIT_STACK_FAILED` (1), the error text must start with `the bench stopped:`, and the output must contain the table header: the header is printed before the first scenario.
-- Nothing is sent to the network in this test, as long as the warm-up really is 0. The test does not check that; the helper below explains the weak link.
+- Nothing is sent to the network in this test, because the warm-up is 0 and the first container reading fails. The helper below makes sure the warm-up really is 0.
+
+```java
+  @Test
+  @DisabledOnOs(value = OS.WINDOWS, disabledReason = "the stand-in for docker is a /bin/sh script")
+  void printsOneRowPerScenarioFromARunAgainstSeatWave(@TempDir Path folder) throws Exception {
+    ContainerCounters steady =
+        new ContainerCounters(
+            fakeDocker(folder, "echo 'usage_usec 5000'; echo \"$TCP\"").toString());
+    int status;
+    try (TestBackend backend = TestBackend.untrusting()) {
+      status = BenchCli.bench(settings(backend), steady, print(out), print(err));
+    }
+
+    assertThat(status).isZero();
+    assertThat(err.toString(StandardCharsets.UTF_8)).isEmpty();
+    assertThat(out.toString(StandardCharsets.UTF_8))
+        .contains(BenchReport.HEADER, "health ", "  runs (rps): ");
+  }
+
+```
+
+**A whole run.** `steady` is a stand-in `docker` (`fakeDocker`, below) that prints the same counters every time: 5,000 microseconds of processor time and a pair of `Tcp:` lines. `BenchCli.bench(...)` runs the checked settings (`settings`, below: one scenario, `GET /health` on an in-process SeatWave, three runs of 100 ms, no warm-up). The status must be 0, nothing may be printed as a problem, and the output must hold the header, the row of the scenario `health` and its runs line. The address of an in-process SeatWave has a port the system chose, which the settings file would refuse (only 20900 to 20999), so the test calls `bench` with a record it built itself.
+
+```java
+  @DisabledOnOs(value = OS.WINDOWS, disabledReason = "the stand-in for docker is a /bin/sh script")
+  void stopsWithExitStatusOneWhenAContainerRestartsDuringARun(@TempDir Path folder)
+      throws Exception {
+    // Each reading is lower than the one before, as if the container had started again.
+    String goingDown =
+        "used=$(cat \"$0.count\" 2>/dev/null || echo 900000); echo $((used - 1000)) > \"$0.count\";"
+            + " echo \"usage_usec $used\"; echo \"$TCP\"";
+    ContainerCounters restarting = new ContainerCounters(fakeDocker(folder, goingDown).toString());
+    int status;
+    try (TestBackend backend = TestBackend.untrusting()) {
+      status = BenchCli.bench(settings(backend), restarting, print(out), print(err));
+    }
+
+    assertThat(status).isEqualTo(BenchCli.EXIT_STACK_FAILED);
+    assertThat(err.toString(StandardCharsets.UTF_8))
+        .startsWith("the bench stopped: the counters of seatwave-proxy-proxy-1 went down");
+  }
+```
+
+**A container that restarts.** This stand-in keeps a number in a file next to itself (`$0` is the script's own path, so `"$0.count"` is a file beside it). Each call prints the number and stores it less 1,000, so every reading of processor time is lower than the one before, as if the container had started again. The bench must stop with status 1 and a message that names the container and says it restarted: the `IllegalArgumentException` of `Counters.since` became an `IOException` in `BenchCli.growth`. `$((used - 1000))` is shell arithmetic.
+
+```java
+  private static BenchSettings settings(TestBackend backend) {
+    return new BenchSettings(
+        TestBackend.TLS.resolve("seatwave-test-ca.pem"),
+        Duration.ofSeconds(5),
+        Duration.ofSeconds(5),
+        Duration.ZERO,
+        Duration.ofMillis(100),
+        3,
+        2,
+        "seatwave-proxy-proxy-1",
+        "seatwave-proxy-backend-1",
+        List.of(new Scenario("health", backend.plain("/health"), false, ConnectionMode.REUSE)));
+  }
+
+  private static Path fakeDocker(Path folder, String body) throws IOException {
+    Path script = folder.resolve("docker");
+    String tcp = "TCP='Tcp: ActiveOpens PassiveOpens\nTcp: 4 8'; TCP=$(printf \"$TCP\")";
+    Files.writeString(script, "#!/bin/sh\n" + tcp + "\n" + body + "\n", StandardCharsets.UTF_8);
+    Files.setPosixFilePermissions(script, PosixFilePermissions.fromString("rwx------"));
+    return script;
+  }
+```
+
+- `settings(backend)` builds `BenchSettings` directly: the TEST authority, 5-second timeouts, no warm-up, runs of 100 ms, 3 repeats, 2 clients, the two container names and one scenario.
+- `fakeDocker(folder, body)` writes the stand-in. Its first line after `#!/bin/sh` sets the shell variable `TCP` to the two `Tcp:` lines: `printf` turns the `\n` in the text into a real line break, and `$(...)` stores what it printed. The body then prints the processor-time line and `$TCP`.
 
 ```java
   private static Path quickSettings(Path folder) throws IOException {
+    String original = Files.readString(Path.of("config/bench.properties"), StandardCharsets.UTF_8);
+    // Each replaced text must be there: if the file changed, a silent no-op would leave a 5 s
+    // warm-up or the relative CA path in a test that is meant to be quick.
+    assertThat(original).contains("run.warmupMillis=5000", "tls.authorityPem=build/tls/");
     String text =
-        Files.readString(Path.of("config/bench.properties"), StandardCharsets.UTF_8)
+        original
             .replace("run.warmupMillis=5000", "run.warmupMillis=0")
-            .replace(
-                "tls.authorityPem=build/tls/",
-                "tls.authorityPem=" + io.plainround.seatwave.proxy.backend.TestBackend.TLS + "/");
+            .replace("tls.authorityPem=build/tls/", "tls.authorityPem=" + TestBackend.TLS + "/");
     return Files.writeString(folder.resolve("bench.properties"), text, StandardCharsets.UTF_8);
   }
 ```
 
-- `quickSettings` reads `config/bench.properties` and replaces two texts: `run.warmupMillis=5000` becomes `run.warmupMillis=0`, and `tls.authorityPem=build/tls/` becomes the absolute path of the test certificates folder (`TestBackend.TLS`) plus `/`. The paths in the real file are relative to the project folder, which is where Gradle runs the tests, but the absolute path is safer.
+- `quickSettings` reads `config/bench.properties`. It first asserts that the two texts it will replace are there; the comment says why: `replace` does nothing, silently, when its text is missing, and a changed settings file would then leave a 5-second warm-up of real load, or the relative path, in a test meant to be quick. Then it replaces them: `run.warmupMillis=5000` becomes `run.warmupMillis=0`, and `tls.authorityPem=build/tls/` becomes the absolute path of the test certificates folder (`TestBackend.TLS`) plus `/`. The paths in the real file are relative to the project folder, which is where Gradle runs the tests, but the absolute path is safer.
 - The new text is written to a file in the temporary folder.
-- If the text in `config/bench.properties` changes, the `replace` silently does nothing. With a 5-second warm-up still in place, the test would start sending load to `127.0.0.1:20911` for five seconds before it reaches the missing `docker` program.
-- The absolute path has to match the settings pattern for a file name: at most 200 characters of letters, digits and `_ . / -`. When the repository is checked out in a folder whose path is long, this test fails with a settings problem and exit status 2, although nothing in the code is wrong. The writer saw this in a scratch folder with a long path.
+- The absolute path may sit in a deep folder or one with a space: file paths in settings may hold any character but a control character. (With version 1.0.0's 200-character rule, this test failed in a deep checkout with a settings problem and exit status 2.)
 
 ```java
   private static PrintStream print(ByteArrayOutputStream bytes) {
@@ -276,10 +358,20 @@ package io.plainround.seatwave.proxy.bench;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.sun.net.httpserver.HttpServer;
 import io.plainround.seatwave.proxy.backend.TestBackend;
 import io.plainround.seatwave.proxy.tls.TlsFiles;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -386,6 +478,53 @@ class LoadRunTest {
 
 ```java
   @Test
+  void countsCacheLookupsAndHitsFromTheCacheStatusHeader() throws Exception {
+    try (CacheStand cache = new CacheStand()) {
+      LoadResult result =
+          runner.run(new Scenario("cached", cache.uri(), false, ConnectionMode.REUSE), RUN, 1);
+
+      assertThat(result.cacheLookups()).isEqualTo(result.requests()).isPositive();
+      // The stand-in answers HIT and MISS in turn, from HIT: half the lookups, rounded up, hit.
+      assertThat(result.cacheHits()).isEqualTo((result.requests() + 1) / 2);
+    }
+  }
+
+  @Test
+  void countsARefusedConnectionAsAnErrorAndKeepsGoing() throws Exception {
+    URI closed;
+    try (ServerSocket gone = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+      closed = URI.create("http://127.0.0.1:" + gone.getLocalPort() + "/health");
+    }
+
+    LoadResult reused =
+        runner.run(new Scenario("refused", closed, false, ConnectionMode.REUSE), RUN, 1);
+    LoadResult fresh =
+        runner.run(new Scenario("refused", closed, false, ConnectionMode.NEW), RUN, 1);
+
+    assertThat(reused.requests()).isZero();
+    assertThat(reused.errors()).isGreaterThan(1);
+    assertThat(fresh.requests()).isZero();
+    assertThat(fresh.errors()).isGreaterThan(1);
+  }
+
+  @Test
+  void sendsTheSameHostHeaderWithThePortInBothModes() throws Exception {
+    try (CacheStand stand = new CacheStand()) {
+      runner.run(new Scenario("host-reuse", stand.uri(), false, ConnectionMode.REUSE), RUN, 1);
+      runner.run(new Scenario("host-new", stand.uri(), false, ConnectionMode.NEW), RUN, 1);
+
+      assertThat(stand.hosts()).containsExactly("127.0.0.1:" + stand.uri().getPort());
+    }
+  }
+
+```
+
+- **Cache hits.** SeatWave sends no `X-Cache-Status`; only the proxy adds it. So the test uses `CacheStand` (below), a small server that answers HIT and MISS in turn, starting with HIT. With one client every answer is counted in order: every request is a lookup (`cacheLookups` equals `requests`), and half of them, rounded up, are hits, `(requests + 1) / 2` in whole-number division. This checks the counting behind the table's `hit %` column, which no test reached before.
+- **A refused connection.** A `ServerSocket` on port 0 gets a free port from the system and is closed again at once, so nothing listens there. Both modes must count only errors, more than one each: the loop goes on after a refused request instead of stopping the run (`catch (IOException refused)` in `LoadRun.loop`).
+- **The same `Host` header.** One run in each mode against `CacheStand`, which remembers every `Host` it saw in a set. The set must hold one value, `127.0.0.1:<port>`: the hand-written request of the new-connection mode now sends the port, as `HttpClient` does.
+
+```java
+  @Test
   void takesPercentilesByTheNearestRankRule() {
     List<Long> sorted = List.of(1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L);
 
@@ -411,11 +550,52 @@ class LoadRunTest {
             () -> new Scenario("Bad Name", backend.plain("/"), false, ConnectionMode.NEW))
         .isInstanceOf(IllegalArgumentException.class);
   }
+
+  /**
+   * A server that answers every request with a small body and an {@code X-Cache-Status} of HIT and
+   * MISS in turn, the header the proxy adds, and remembers every Host header it was sent.
+   */
+  private static final class CacheStand implements AutoCloseable {
+    private final HttpServer server;
+    private final AtomicInteger answered = new AtomicInteger();
+    private final Set<String> hosts = ConcurrentHashMap.newKeySet();
+
+    CacheStand() throws IOException {
+      server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 16);
+      server.createContext(
+          "/",
+          exchange -> {
+            try (exchange) {
+              hosts.add(exchange.getRequestHeaders().getFirst("Host"));
+              boolean isHit = answered.getAndIncrement() % 2 == 0;
+              byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+              exchange.getResponseHeaders().set("X-Cache-Status", isHit ? "HIT" : "MISS");
+              exchange.sendResponseHeaders(200, body.length);
+              exchange.getResponseBody().write(body);
+            }
+          });
+      server.start();
+    }
+
+    URI uri() {
+      return URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/static/x");
+    }
+
+    Set<String> hosts() {
+      return Set.copyOf(hosts);
+    }
+
+    @Override
+    public void close() {
+      server.stop(0);
+    }
+  }
 }
 ```
 
 - The fifth test checks three refusals: a run with 0 clients; a scenario with an `ftp://` address; a scenario named `Bad Name`. Each must throw `IllegalArgumentException`.
 - The first lambda captures `scenario` and `runner`; Java lets a lambda use a local variable that is never changed afterwards (it is "effectively final").
+- `CacheStand` is the stand-in server, on the JDK's own `HttpServer` (the one SeatWave uses), on port 0. Its handler records the `Host` header, sets `X-Cache-Status` to HIT for every even answer and MISS for every odd one (`answered.getAndIncrement() % 2 == 0`, a counter that is safe across threads), and sends a two-byte body `{}`. `ConcurrentHashMap.newKeySet()` is a set that many threads may add to at once. It is `AutoCloseable`, so `try (CacheStand cache = new CacheStand())` stops it at the end of the test.
 
 ### `bench/BenchSettingsTest.java`
 
@@ -636,6 +816,40 @@ class BenchReportTest {
 
 ```java
   @Test
+  void chargesCpuToEveryRequestSentAndWarnsAboutAFailingRow() {
+    // 2,000 successes and 2,000 failures for 3,000,000 us of proxy CPU: 750 ms per thousand sent.
+    List<BenchRow> runs =
+        List.of(failing(2_000, 2_000), failing(2_000, 2_000), failing(2_000, 2_000));
+
+    String text = BenchReport.render(runs);
+
+    assertThat(text)
+        .contains(" 750.0 ")
+        .doesNotContain("1500.0")
+        .contains("  warning: 50 percent of the requests of this run failed");
+  }
+
+  @Test
+  void warnsWhenTheRunsDifferByMoreThanTwoTimes() {
+    List<BenchRow> runs = List.of(row(957, 1_000_000), row(299, 1_000_000), row(4, 1_000_000));
+
+    String text = BenchReport.render(runs);
+
+    assertThat(text)
+        .contains("  warning: the runs differ by more than 2 times (4 to 957 rps)")
+        .doesNotContain("percent of the requests");
+    assertThat(BenchReport.render(List.of(row(100, 1), row(150, 1), row(200, 1))))
+        .doesNotContain("warning");
+  }
+
+```
+
+- **CPU per request sent.** Three equal runs of 2,000 successes and 2,000 failures, with 3,000,000 microseconds of proxy time each (`failing`, below). Divided by all 4,000 requests sent, that is 750 ms per thousand, which the row must show (`" 750.0 "`, with spaces, so that `1750.0` cannot match). Divided by the 2,000 successes alone, as version 1.0.0 did, it would be `1500.0`, which the text must not contain. Half the requests failed, so the first warning line must be there with `50 percent`.
+- **Runs far apart.** Runs of 957, 299 and 4 requests per second, the README's first `proxy-no-reuse` row, must bring the second warning with the slowest and fastest throughput, and no error warning (no request failed). Runs of 100, 150 and 200 are within twice of each other, so they must bring no warning at all: the test proves both that the warning comes and that it does not come for an ordinary spread.
+
+
+```java
+  @Test
   void refusesFewerThanThreeRunsAndMoreHitsThanLookups() {
     assertThatThrownBy(() -> BenchReport.median(List.of(row(1, 1), row(2, 2))))
         .isInstanceOf(IllegalArgumentException.class);
@@ -666,6 +880,24 @@ class BenchReportTest {
 }
 ```
 
+```java
+  private static BenchRow failing(long requests, long errors) {
+    LoadResult result =
+        new LoadResult(
+            requests,
+            errors,
+            Duration.ofSeconds(1),
+            Duration.ofMillis(1),
+            Duration.ofMillis(2),
+            requests * 36_894,
+            requests * 36_894,
+            0,
+            0);
+    return new BenchRow(SCENARIO, result, new Counters(3_000_000, 8, 4), new Counters(1_000, 4, 0));
+  }
+```
+
+- `failing(requests, errors)` builds a run with failures: one second, the seat map's 36,894 bytes per successful response, no cache lookups, and 3,000,000 microseconds of proxy time.
 - `row(requests, proxyCpuMicros)` builds a `BenchRow` from numbers: a run of 1 second, p50 1 ms, p99 2 ms, wire bytes `requests * 2,453` and plain bytes `requests * 36,894` (the gzip and plain sizes of the README's production row), half of the requests as cache hits, and counters for the proxy and SeatWave. The test has no real network.
 
 ### `slow/SlowClientsTest.java`
@@ -675,15 +907,24 @@ package io.plainround.seatwave.proxy.slow;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.plainround.seatwave.proxy.backend.BackendSettings;
 import io.plainround.seatwave.proxy.backend.TestBackend;
 import io.plainround.seatwave.proxy.config.SettingsReader;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.PrintStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 ```
@@ -694,35 +935,85 @@ import org.junit.jupiter.api.io.TempDir;
 class SlowClientsTest {
 
   @Test
-  void keepsSeatWaveWorkersBusyWhileSlowClientsReadAndCountsEveryDownload() throws Exception {
+  void countsEveryCompleteDownloadOfALargeFileWithItsHeadAndBody() throws Exception {
     try (TestBackend backend = TestBackend.untrusting()) {
-      SlowSettings settings =
-          new SlowSettings(
-              backend.plain("/static/poster-arena.bin"),
-              4,
-              20_000,
-              Duration.ofMillis(5),
-              4_096,
-              backend.plain("/health"),
-              backend.admin("/metrics"),
-              Duration.ofMillis(5),
-              Duration.ofSeconds(30));
+      SlowSettings settings = settings(backend, backend.plain("/static/poster-arena.bin"), 20_000);
 
       SlowResult result = SlowClients.run(settings);
 
       assertThat(result.completed()).isEqualTo(4);
       assertThat(result.failed()).isZero();
-      assertThat(result.bodyBytes()).isGreaterThan(300_000);
+      // The 300,000-byte body and a head of a few hundred bytes.
+      assertThat(result.responseBytes()).isBetween(300_001L, 301_000L);
       assertThat(result.workers()).isEqualTo(8);
       assertThat(result.workerSeconds()).isPositive();
-      assertThat(settings.bytesPerSecond()).isEqualTo(4_000_000);
+      assertThat(settings.bytesPerSecond()).isEqualTo(20_000_000);
     }
+  }
+
+  @Test
+  void seesTheWorkersThatSlowRequestsKeepBusy() throws Exception {
+    // A long poll holds its worker for the whole hold, on any kernel; a slow reader of a large file
+    // holds one only while the kernel's send buffer is full, which differs between machines.
+    BackendSettings.Timing longHold =
+        new BackendSettings.Timing(
+            Duration.ofSeconds(1), Duration.ofMillis(100), Duration.ofMillis(350));
+    try (TestBackend backend = TestBackend.start(List.of("192.0.2.1"), longHold, 8, 64)) {
+      SlowSettings settings =
+          settings(backend, backend.plain("/v1/events/1/seat-changes?after=1"), 1_000);
+
+      SlowResult result = SlowClients.run(settings);
+
+      assertThat(result.completed()).isEqualTo(4);
+      assertThat(result.workersBusyMax()).isBetween(1, 8);
+      assertThat(result.workerSeconds()).isGreaterThanOrEqualTo(4.0);
+    }
+  }
+
+  @Test
+  void readsTheStatusLineAcrossManySmallReads() throws Exception {
+    try (TestBackend backend = TestBackend.untrusting()) {
+      // 10 bytes a read: the status line and the head arrive over many reads.
+      SlowResult result = SlowClients.run(settings(backend, backend.plain("/health"), 10));
+
+      assertThat(result.completed()).isEqualTo(4);
+      assertThat(result.failed()).isZero();
+    }
+  }
+
+  @Test
+  void countsADownloadThatEndsBeforeItsContentLengthAsFailed() throws Exception {
+    // Closed in reverse order: the server socket first, which ends the accepting task.
+    try (TestBackend backend = TestBackend.untrusting();
+        ExecutorService accepting = Executors.newVirtualThreadPerTaskExecutor();
+        ServerSocket shortServer = new ServerSocket(0, 8, InetAddress.getLoopbackAddress())) {
+      accepting.submit(() -> promiseMoreThanIsSent(shortServer));
+      URI target = URI.create("http://127.0.0.1:" + shortServer.getLocalPort() + "/poster");
+
+      SlowResult result = SlowClients.run(settings(backend, target, 1_000));
+
+      assertThat(result.completed()).isZero();
+      assertThat(result.failed()).isEqualTo(4);
+    }
+  }
+
+  @Test
+  void decidesACompleteDownloadByStatusAndContentLength() {
+    String head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+
+    assertThat(SlowClients.isComplete(head + "hello", head.length() + 5)).isTrue();
+    assertThat(SlowClients.isComplete(head + "he", head.length() + 2)).isFalse();
+    assertThat(SlowClients.isComplete("HTTP/1.1 200 OK\r\n\r\nhello", 24)).isFalse();
+    assertThat(SlowClients.isComplete("HTTP/1.1 200 OK\r\nContent-Length: 5", 34)).isFalse();
   }
 ```
 
-- The first test runs the real slow clients against a real SeatWave. The settings are built in code (the lab-address rule of `SlowSettings.from` is not used): 4 clients download `/static/poster-arena.bin` (about 300 KB), 20,000 bytes every 5 ms, receive buffer 4,096, a probe to `/health`, the metrics from the operations listener, a 5 ms sample pause and a 30-second timeout.
-- It expects: 4 complete, 0 failed; more than 300,000 bytes per download (the poster is 300,000 bytes, plus headers); 8 workers in all (the `untrusting()` backend has 8); a positive `workerSeconds` (the server's busy-seconds counter grew); and `bytesPerSecond()` of 4,000,000 (20,000 bytes every 5 ms).
-- The test name says it "keeps SeatWave workers busy", but it checks only that the worker counter grew. It does not check `workersBusyMax`, and with 4 clients on the loopback address a busy count of 1 or even 0 is possible, as the "Try it yourself" section of the slow-client notes shows.
+- The first five tests use `settings(backend, target, bytesPerTick)` (below): 4 clients, a 1 ms pause between reads, a receive buffer of 4,096 bytes, a probe to `/health` and the metrics of the same in-process SeatWave. The lab-address rule of `SlowSettings.from` is not used, because the settings are built in code.
+- **A large file.** The 4 clients download `/static/poster-arena.bin`, 20,000 bytes a read. All 4 must be complete and none failed; each read between 300,001 and 301,000 bytes, the 300,000-byte poster and a head of a few hundred bytes (the comment says so); 8 workers in all (the `untrusting()` backend has 8); a positive `workerSeconds`; and `bytesPerSecond()` of 20,000,000 (20,000 bytes every 1 ms). The test checks no busy count: how long a slow reader of a large file holds a worker depends on the kernel's send buffer, and on this Mac's loopback the kernel took the whole answer at once.
+- **Busy workers.** The comment explains the choice of target: a long poll holds its worker for the whole hold, on any kernel. With a hold of 1 second, 4 clients keep up to 4 workers busy for a second, which the sampler (every 5 ms) must see: `workersBusyMax` between 1 and 8, and at least 4 worker-seconds in all. (The first version's test was named for busy workers but never checked `workersBusyMax`.)
+- **Small reads.** 10 bytes a read is less than the status line `HTTP/1.1 200 OK`. All 4 downloads of `/health` must still be complete: the head is collected across reads.
+- **A download cut short.** `shortServer` is a `ServerSocket` on a free port, served by `promiseMoreThanIsSent` (below) on a virtual thread: it promises 100,000 bytes and sends 20. All 4 downloads must fail. The comment explains the order of the three resources: try-with-resources closes them from the last to the first, so the server socket closes first, which ends the accepting task, and only then does the executor, which waits for its tasks, close.
+- **The completeness rule** called directly: a `200` whose body is exactly the 5 bytes `Content-Length` promised is complete; 2 bytes is not; a `200` without `Content-Length` is not; a head that never ends is not.
 
 ```java
   @Test
@@ -749,6 +1040,42 @@ class SlowClientsTest {
 ```
 
 - The second test aims 2 clients at `/missing` (404). Both must count as failed, none as complete: a download is complete only with status 200.
+
+```java
+  private static SlowSettings settings(TestBackend backend, URI target, int bytesPerTick) {
+    return new SlowSettings(
+        target,
+        4,
+        bytesPerTick,
+        Duration.ofMillis(1),
+        4_096,
+        backend.plain("/health"),
+        backend.admin("/metrics"),
+        Duration.ofMillis(5),
+        Duration.ofSeconds(30));
+  }
+
+  private static Void promiseMoreThanIsSent(ServerSocket server) throws IOException {
+    // A server that promises 100,000 bytes, sends 20 and closes: every client must call it failed.
+    while (!server.isClosed()) {
+      try (Socket client = server.accept()) {
+        client.getInputStream().read(new byte[1_024]);
+        client
+            .getOutputStream()
+            .write(
+                "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n12345678901234567890"
+                    .getBytes(StandardCharsets.US_ASCII));
+      } catch (SocketException closed) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+```
+
+- `settings(...)` is the shared settings of the tests above, with the target and the read size as the two things that change.
+- `promiseMoreThanIsSent(server)` accepts one connection after another until the test closes the server. For each, it reads the request once and writes a head with `Content-Length: 100000` and then only 20 bytes, `12345678901234567890`, and closes. Closing the server makes `accept` throw `SocketException`, which ends the loop. It returns `Void` (the object form of "nothing") so it can be given to `submit`, which takes a task that may throw.
 
 ```java
   @Test
@@ -779,6 +1106,43 @@ class SlowClientsTest {
 
 - The fourth test loads the three real settings files `slow-direct`, `slow-buffered` and `slow-unbuffered` and requires each to be valid. It does not load the three `-poster` variants.
 - It then takes the direct file, changes the target to `http://seatwave.example/` and requires an error: a target outside the lab network is refused. `var properties` lets the compiler pick the type (`Properties`).
+
+```java
+  @Test
+  void printsARunAndStopsWithStatusOneWhenTheMetricsCannotBeRead() throws Exception {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    ByteArrayOutputStream err = new ByteArrayOutputStream();
+    PrintStream printer = new PrintStream(out, true, StandardCharsets.UTF_8);
+    PrintStream errors = new PrintStream(err, true, StandardCharsets.UTF_8);
+    int ran;
+    int broken;
+    try (TestBackend backend = TestBackend.untrusting()) {
+      SlowSettings good = settings(backend, backend.plain("/health"), 1_000);
+      SlowSettings noMetrics =
+          new SlowSettings(
+              good.target(),
+              1,
+              1_000,
+              Duration.ofMillis(1),
+              4_096,
+              good.fastProbe(),
+              backend.plain("/missing"),
+              Duration.ofMillis(5),
+              Duration.ofSeconds(30));
+
+      ran = SlowClientsCli.runAndPrint(good, printer, errors);
+      broken = SlowClientsCli.runAndPrint(noMetrics, printer, errors);
+    }
+
+    assertThat(ran).isZero();
+    assertThat(out.toString(StandardCharsets.UTF_8)).contains("slow clients: 4 complete, 0 failed");
+    assertThat(broken).isEqualTo(SlowClientsCli.EXIT_RUN_FAILED);
+    assertThat(err.toString(StandardCharsets.UTF_8)).startsWith("the run stopped: ");
+  }
+
+```
+
+- **A whole run of the command, and a failed one.** `SlowClientsCli.runAndPrint` runs good settings against an in-process SeatWave: status 0 and the second output line `slow clients: 4 complete, 0 failed`. Then the same settings with the metrics address changed to `/missing`, which answers 404: the run cannot read SeatWave's metrics, so the status is `EXIT_RUN_FAILED` (1) and the error output starts with `the run stopped: `. The two results are kept in `ran` and `broken` and checked after the backend is closed.
 
 ```java
   @Test
@@ -824,7 +1188,7 @@ class SlowClientsTest {
 - The fifth test checks `SlowClientsCli`. It builds a `SlowResult` with the numbers of the README's direct run (500 complete, 37,188 bytes, 64 of 64 workers busy, 104.45 worker-seconds) and calls `print`. It then calls `run` with no arguments and with an empty settings file.
 - The printed text must contain the first line's description, `500 slow clients at once, each reading 5000 bytes every 100 ms (50 KB/s)`, and the third line's `at most 64 of 64 busy at once (0 readings missed); 104.45 worker-seconds`. The error output also goes to the same buffer, so it must contain `slow.targetUri is missing`.
 - Both `run` calls must return `EXIT_BAD_USAGE`.
-- The success path of `SlowClientsCli.run` (the part that runs the clients and prints) is not executed by any test: the Gradle coverage report lists lines 58 to 62 of `SlowClientsCli.java` as missed.
+
 
 ## Try it yourself
 
@@ -842,17 +1206,17 @@ Gradle prints `BUILD SUCCESSFUL`. To see each test's name, add `--info` or `-i`.
 
 **3. See the settings test catch a broken settings file.** In a copy, change `run.repeats=3` to `run.repeats=2` in `config/bench.properties` and run `./gradlew test --tests '*BenchSettingsTest'`. `readsTheBenchSettingsOfTheRepository` fails: Gradle prints `java.lang.IllegalStateException at BenchSettingsTest.java:20`, and the message in `build/test-results/test/TEST-io.plainround.seatwave.proxy.bench.BenchSettingsTest.xml` is `[run.repeats must be from 3 to 50, but was 2]`. Change it back.
 
-**4. Read the coverage of this part.** Run `./gradlew check` and open `build/reports/jacoco/test/html/index.html` in a browser. The package `io.plainround.seatwave.proxy.bench` shows which lines the tests ran (green) and which they did not (red). On the writer's run these `bench` lines were not run by any test at all: `BenchCli` 35, 36, 79, 80, 81, 92, 96 to 101, 103 and 105 (the whole of a successful bench run, since a real run needs the stack); `LoadRun` 123 and 125 to 127 (a refused request in the loop, and an interrupt), 181 (the deadline check of a new connection), 190 to 194 (a client that hangs or fails) and 263 to 265 (the counting of `X-Cache-Status` hits and lookups, because no test talks to a cache); `ContainerCounters` 66, 74, 75, 112 and 113; `RawResponse` 65; `BenchReport` 51; `BenchRow` 50; `LoadResult` 42; `BenchSettings` 68. The same view shows `slow` lines 135 to 139, 156, 158, 160, 177, 179, 181, 194, 229, 252 to 255, 257 and 265 to 267 of `SlowClients.java`, and 35, 36 and 58 to 62 of `SlowClientsCli.java`, as not run.
+**4. Read the coverage of this part.** Run `./gradlew check` and open `build/reports/jacoco/test/html/index.html` in a browser. The package `io.plainround.seatwave.proxy.bench` shows which lines the tests ran (green) and which they did not (red). In a run of version 1.0.1 in a copy of the repository, these `bench` lines were not run by any test: `BenchCli` 35 and 36 (`main`, which ends the process) and 107 (the warm-up, which every test sets to 0); `LoadRun` 126 and 127 (an interrupt), 183 (the deadline check of a new connection) and 192 to 196 (a client that hangs or fails); `ContainerCounters` 66, 74, 75, 112 and 113; `RawResponse` 65; `LoadResult` 42; `BenchSettings` 67. The same view shows lines 144 to 148, 165, 167, 169, 186, 188, 190, 238, 280 to 283, 285 and 293 to 295 of `SlowClients.java`, and 35, 36 and 57 of `SlowClientsCli.java`, as not run. (Version 1.0.0 also left the whole of a successful bench run, the counting of cache hits and a refused request unrun; the tests added in 1.0.1 run them.)
 
 ## Mistakes people make
 
 - **Testing with the clock.** A test that says "this must take under 50 ms" fails on a busy machine. These tests check counts and exact byte values, and use 300 ms only as the length of a run.
 - **Sharing state between tests.** Each test class starts its own server and closes it. Tests may run in any order.
-- **Leaving the counting of the headline numbers untested.** `LoadRun` counts cache hits, but no test sends it a response with `X-Cache-Status`. The `hit %` column of the README rests on lines that the tests never run.
+- **Leaving the counting of the headline numbers untested.** The `hit %` column of the README rests on `LoadRun`'s counting of `X-Cache-Status`. Version 1.0.0 had no test that sent it such a header; `CacheStand` does now.
 - **Checking only that something happened.** `isPositive()` on requests proves little. The strong check is the exact byte count.
-- **Writing a test that depends on the text of a file it does not own.** `quickSettings` replaces a literal in `config/bench.properties`. When that text changes, the test changes meaning without failing.
-- **Assuming the repository lives in a short path.** The settings pattern for a file name allows 200 characters; a long checkout path breaks `BenchCliTest`.
-- **A name that promises more than the test checks.** `keepsSeatWaveWorkersBusyWhileSlowClientsRead...` asserts less than its name says.
+- **Writing a test that depends on the text of a file it does not own.** `quickSettings` replaces a literal in `config/bench.properties`. If that text changed, the replace would do nothing and the test would change meaning without failing, so it first asserts the literal is there.
+- **Assuming the repository lives in a short path.** A test that writes an absolute path into settings must work in any folder. Version 1.0.0's 200-character path rule broke `BenchCliTest` in a deep checkout.
+- **A name that promises more than the test checks.** Version 1.0.0's `keepsSeatWaveWorkersBusyWhileSlowClientsRead...` never checked the busy count. A test's name must say what its assertions prove.
 
 ## Check yourself
 

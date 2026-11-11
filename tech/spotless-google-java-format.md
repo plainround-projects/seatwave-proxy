@@ -16,7 +16,7 @@ With one enforced layout nobody argues about style, reviews show only real chang
 | --- | --- |
 | `build.gradle.kts` | Switches the plugin on (`alias(libs.plugins.spotless)`) and configures it (`spotless { java { ... } }`). |
 | `gradle/libs.versions.toml` | Holds the two versions: `spotless = "8.11.0"` and `googleJavaFormat = "2.0.0"`. |
-| `src/main/java/**`, `src/test/java/**` | The files it checks (every Java source file of the project, 54 main files and 27 test files). |
+| `src/main/java/**`, `src/test/java/**` | The files it checks (every Java source file of the project, 54 main files and 29 test files). |
 | `.editorconfig` | Declares two-space indentation for Java, the same as the formatter (`editorconfig.md`). |
 
 ## How it works underneath

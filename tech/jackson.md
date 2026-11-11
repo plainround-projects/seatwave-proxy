@@ -51,6 +51,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.exc.InputCoercionException;
+import com.fasterxml.jackson.core.exc.StreamReadException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.MapperFeature;
@@ -118,11 +119,9 @@ import java.io.IOException;
         return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
       }
       T value = mapper.readValue(parser, type);
-      if (parser.nextToken() != null) {
-        return Result.error(
-            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
-      }
-      return Result.success(value);
+      return hasMore(parser)
+          ? Result.error(new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"))
+          : Result.success(value);
     } catch (UnrecognizedPropertyException unknownField) {
       return Result.error(
           new BindingProblem(
@@ -134,6 +133,14 @@ import java.io.IOException;
       if (unbound.getCause() instanceof InputCoercionException) {
         return Result.error(
             new BindingProblem(pointerOf(unbound), "is out of range for this field"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (StreamReadException malformed) {
+      if (malformed.getOriginalMessage().startsWith(DUPLICATE_MESSAGE)
+          && malformed.getProcessor() != null) {
+        // The parser stopped on the repeated name, so its context is the path of that field.
+        String pointer = malformed.getProcessor().getParsingContext().pathAsPointer().toString();
+        return Result.error(new BindingProblem(pointer, "appears more than once"));
       }
       return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
@@ -149,23 +156,23 @@ import java.io.IOException;
 - `Objects.requireNonNull(...)` twice refuse a `null` argument. That is a programming error, so it throws.
 - The comment says the parser is driven by hand: "an empty body, a body that is not an object and data after the object each get their own message instead of one generic type error." `try (JsonParser parser = mapper.createParser(json))` opens a parser on the text; the **try-with-resources** closes it at the end.
 - `JsonToken first = parser.nextToken();` reads the first token. `null` means the text was empty. Anything but `START_OBJECT` means the body is not an object, for example `[1]`.
-- `T value = mapper.readValue(parser, type);` binds the object to the record. The next line, `if (parser.nextToken() != null)`, checks that nothing follows the closing brace.
-- The `catch` blocks go from the most specific exception to the most general, because Java takes the first block that fits. `UnrecognizedPropertyException` becomes the pointer `"/" + escaped(unknownField.getPropertyName())` with "is not a field of this request". `MismatchedInputException` becomes "has the wrong type". Another `JsonMappingException` is checked for a cause of `InputCoercionException`, the comment's example being `99999999999999999999`, "valid JSON; it only does not fit the field's type", and becomes "is out of range for this field". Any other `JacksonException` becomes "the body is not valid JSON". The `IOException` block is for a failure that cannot happen when reading a `String`, and so it throws.
+- `T value = mapper.readValue(parser, type);` binds the object to the record. The next line asks `hasMore(parser)` (below) whether anything follows the closing brace.
+- The `catch` blocks go from the most specific exception to the most general, because Java takes the first block that fits. `UnrecognizedPropertyException` becomes the pointer `"/" + escaped(unknownField.getPropertyName())` with "is not a field of this request". `MismatchedInputException` becomes "has the wrong type". Another `JsonMappingException` is checked for a cause of `InputCoercionException`, the comment's example being `99999999999999999999`, "valid JSON; it only does not fit the field's type", and becomes "is out of range for this field". A `StreamReadException` is a failure while reading the text; if its message starts with `Duplicate field '` (the switch `STRICT_DUPLICATE_DETECTION` reports a repeated field this way), the parser's position names the field, as the pointer `/eventId`, with "appears more than once". Any other `JacksonException` becomes "the body is not valid JSON". The `IOException` block is for a failure that cannot happen when reading a `String`, and so it throws.
 
-I sent eight bad bodies to a running SeatWave (`POST /v1/holds`) and read the `detail` of each answer:
+I sent eight bad bodies to a running SeatWave (`POST /v1/holds`) of the first version, and the changed ones again to a SeatWave of version 1.0.1, and read the `detail` of each answer. Two answers changed in 1.0.1; the table shows both:
 
 | Body | `detail` in the answer |
 | --- | --- |
 | (empty) | `the body is empty; send a JSON object` |
 | `[1]` | `the body must be a JSON object` |
-| `{"eventId":1,"seat":"A-3","customer":"Sam"} x` | `the body is not valid JSON` |
+| `{"eventId":1,"seat":"A-3","customer":"Sam"} x` | 1.0.0: `the body is not valid JSON`; 1.0.1: `the body has data after the JSON object` |
 | `{"eventId":"1","seat":"A-3","customer":"Sam"}` | `/eventId has the wrong type` |
 | `{"eventId":99999999999999999999,...}` | `/eventId is out of range for this field` |
 | `{"eventId":1,"seat":"A-3",` | `the body is not valid JSON` |
-| `{"eventId":1,"eventId":2,...}` | `the body is not valid JSON` |
+| `{"eventId":1,"eventId":2,...}` | 1.0.0: `the body is not valid JSON`; 1.0.1: `/eventId appears more than once` |
 | `{"eventId":null,...}` | `/eventId must be 1 or more` |
 
-Two rows differ from what the method's own messages suggest. A stray `x` after the object is not a valid token, so Jackson raises a syntax error while looking for more data, and the "data after the JSON object" message is reached only when the extra data is itself valid JSON (for example a second object). The last row binds, because the record uses `Long`, a type that may be `null`; the route then refuses it with its own rule.
+`JsonCodecTest` checks the two 1.0.1 answers with the same shapes of body. The first: a stray `x` after the object is not a valid token, so Jackson raises a syntax error while looking for more data; `hasMore` treats that error as "there is more", because any text after the object is the problem. The second: the repeated field is found while reading, and the codec reads the field's name from the parser. The last row binds, because the record uses `Long`, a type that may be `null`; the route then refuses it with its own rule.
 
 ### `write` and the pointer helpers
 
@@ -182,6 +189,16 @@ Two rows differ from what the method's own messages suggest. A stray `x` after t
       return mapper.writeValueAsString(value);
     } catch (JsonProcessingException notWritable) {
       throw new IllegalArgumentException("not writable as JSON", notWritable);
+    }
+  }
+
+  private static boolean hasMore(JsonParser parser) throws IOException {
+    try {
+      return parser.nextToken() != null;
+    } catch (JacksonException notJson) {
+      // Text after the object that is not JSON at all ("{...} x") is still data after the object,
+      // and that is the reason the client needs, not "not valid JSON".
+      return true;
     }
   }
 
@@ -203,6 +220,7 @@ Two rows differ from what the method's own messages suggest. A stray `x` after t
 
 - `write` calls `mapper.writeValueAsString(value)`. Writing can fail only if the value cannot be written, which is a bug, so the `JsonProcessingException` is turned into an `IllegalArgumentException`.
 - `pointerOf` builds a **JSON pointer** (RFC 6901), a path such as `/eventId` that names one place in a JSON document. Jackson's exception carries the path it was reading; `getPath().stream().map(...).collect(Collectors.joining("/", "/", ""))` writes each step (a field name, or a list index) and joins them with `/` after a leading `/`. A stream is a pipeline of steps over a list; `joining` glues the strings with a separator, a prefix and a suffix.
+- `hasMore` reads one more token. `null` means nothing follows; a token means more JSON follows; a `JacksonException` means text that is not JSON follows. Only the first case is "no more", so the `catch` returns `true`.
 - `escaped` writes a `~` as `~0` and a `/` as `~1`, in that order, as RFC 6901 requires, so a field name that contains a slash cannot be mistaken for two steps.
 
 ```java

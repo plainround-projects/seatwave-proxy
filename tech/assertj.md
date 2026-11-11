@@ -119,14 +119,18 @@ In the test above, `.hasSize(36_894)` on the body text checks the length of the 
 
     assertThat(headers)
         .contains("proxy_set_header X-Forwarded-For $remote_addr;")
-        .contains("proxy_set_header Forwarded \"for=$remote_addr;proto=$scheme\";");
+        .contains("proxy_set_header Forwarded \"for=\\\"$forwarded_node\\\";proto=$scheme\";");
+    // RFC 7239: an IPv6 node goes in brackets, and only the map in nginx.conf adds them.
+    assertThat(read(NGINX.resolve("nginx.conf")))
+        .containsPattern(
+            "(?s)map \\$remote_addr \\$forwarded_node \\{\\s*~:\\s+\"\\[\\$remote_addr\\]\";");
     for (Path file : edgeFiles()) {
       assertThat(read(file)).as(file.toString()).doesNotContain("$proxy_add_x_forwarded_for");
     }
   }
 ```
 
-- `contains(...)` on text checks that a piece occurs somewhere; with several arguments it checks all of them. `doesNotContain(...)` checks the opposite. The first test reads the proxy's configuration as text and checks rules about it (`tests-stack-walkthrough.md`).
+- `contains(...)` on text checks that a piece occurs somewhere; with several arguments it checks all of them. `containsPattern(...)` is the same with a **regular expression** (a pattern language for text, `java.md`): it passes when the pattern matches some part of the text. Here it proves that `nginx.conf` holds the `map` that puts an IPv6 address in brackets. `doesNotContain(...)` checks the opposite. The first test reads the proxy's configuration as text and checks rules about it (`tests-stack-walkthrough.md`).
 - `.as("a location in " + file.getFileName())` gives the check a **label**. When it fails, the message starts with the label, so a failure in a loop over many files says which file failed. `ClientAddressTest` does the same with `as(malformed)`, where the label is the bad header value.
 
 ### Numbers and comparisons

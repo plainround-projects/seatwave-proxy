@@ -180,7 +180,7 @@ public record SlowSettings(
 
 - `from(reader)` reads the nine keys, with their allowed ranges. The text keys must match `LAB_URI`. The receive buffer is read between 1,024 and 1,000,000.
 - If any problem was collected, it returns the list. Otherwise it builds the record, turning the two address texts into `URI` values with `URI.create`.
-- Note that `slow.bytesPerTick` may be as small as 1. A value below the length of a status line (about 15 characters) makes every download count as failed; see "Mistakes people make".
+- Note that `slow.bytesPerTick` may be as small as 1. The client collects the response's head across as many reads as it takes, so even 10 bytes per tick reads the status line correctly (Try it yourself, command 3). It is only slow.
 
 ### `slow/SlowResult.java`
 
@@ -199,7 +199,7 @@ import java.util.Objects;
  *
  * @param completed slow clients that read a whole 200 response
  * @param failed slow clients that got anything else, or gave up
- * @param bodyBytes the bytes one complete download read, headers included
+ * @param responseBytes the bytes one complete download read, its head and its body
  * @param downloadP50 the median time a slow client needed for its download
  * @param downloadMax the longest download
  * @param workersBusyMax the most SeatWave workers busy at one reading
@@ -215,7 +215,7 @@ import java.util.Objects;
 public record SlowResult(
     int completed,
     int failed,
-    long bodyBytes,
+    long responseBytes,
     Duration downloadP50,
     Duration downloadMax,
     int workersBusyMax,
@@ -230,10 +230,10 @@ public record SlowResult(
 ```
 
 - The fourteen components. Group them in your head:
-  - The slow clients: `completed`, `failed`, `bodyBytes`, `downloadP50`, `downloadMax`.
+  - The slow clients: `completed`, `failed`, `responseBytes`, `downloadP50`, `downloadMax`.
   - SeatWave's workers: `workersBusyMax`, `missedSamples`, `workers`, `workerSeconds`.
   - The fast probe: `probeP50`, `probeP99`, `probeMax`, `probes`, `probeFailures`.
-- `bodyBytes` is documented as "the bytes one complete download read, headers included". Its name says body, but the number includes the headers. The README's 37,187 for the seat map is the 36,894-byte body plus 293 bytes of headers.
+- `responseBytes` is "the bytes one complete download read, its head and its body": the whole response, as its name now says. The README's 37,187 for the seat map is the 36,894-byte body plus 293 bytes of head. (The first version called it `bodyBytes`, a name that said less than the number held.)
 - `workerSeconds` is the worker time SeatWave spent during the run, all workers together: the sum over workers of the seconds each was busy.
 
 ```java
@@ -303,6 +303,12 @@ public final class SlowClients {
 
 ```java
   private static final Pattern STATUS_LINE = Pattern.compile("HTTP/1\\.[01] (\\d{3}) .*");
+  private static final Pattern CONTENT_LENGTH =
+      Pattern.compile("(?im)^content-length:[ \\t]*(\\d{1,18})[ \\t]*\\r?$");
+  private static final String HEAD_END = "\r\n\r\n";
+  // The most bytes of response head kept: NGINX's and the JDK server's heads are far smaller, and a
+  // head that does not end by then is not one this lab produces.
+  private static final int MAX_HEAD_BYTES = 16_384;
   private static final Pattern BUSY = Pattern.compile("(?m)^seatwave_workers_busy (\\d+)$");
   private static final Pattern WORKERS = Pattern.compile("(?m)^seatwave_workers (\\d+)$");
   private static final Pattern BUSY_SECONDS =
@@ -318,6 +324,9 @@ public final class SlowClients {
 ```
 
 - `STATUS_LINE` reads the three-digit code from `HTTP/1.1 200 OK`; it needs a space after the code.
+- `CONTENT_LENGTH` finds the `Content-Length` header in the head. `(?i)` ignores case (the JDK's server writes `Content-length`, NGINX `Content-Length`), `(?m)` makes `^` and `$` match at each line, `[ \t]*` allows spaces or tabs around the value, `(\d{1,18})` is the number (at most 18 digits, so it always fits in a `long`), and `\r?` allows the carriage return that ends every HTTP header line.
+- `HEAD_END` is the blank line that ends an HTTP head: a carriage return and a line feed, twice.
+- `MAX_HEAD_BYTES = 16_384` bounds how much of the response is kept as text to look for the head. The comment says why the bound is safe: the heads in this lab are a few hundred bytes.
 - The three metric patterns read lines of SeatWave's Prometheus-style text, such as `seatwave_workers_busy 3`. `(?m)` makes `^` and `$` match at each line. `seatwave_workers` is the pool size, `seatwave_workers_busy` the busy count right now, `seatwave_worker_busy_seconds_total` a counter of total busy seconds (digits and a dot).
 - `OK = 200`; `HTTP_PORT = 80`; the two percentile shares; `SIDE_REQUEST_TIMEOUT = 30 s`, the longest a probe or a metrics request may take.
 - The private constructor makes the class a bag of static methods.
@@ -418,12 +427,13 @@ public final class SlowClients {
       InputStream in = socket.getInputStream();
       byte[] buffer = new byte[settings.bytesPerTick()];
       long total = 0;
+      // The head is collected across reads, so a client that reads a few bytes per tick still
+      // sees the whole status line and Content-Length.
       StringBuilder head = new StringBuilder();
       int read;
       while ((read = in.readNBytes(buffer, 0, buffer.length)) > 0) {
-        if (head.length() < buffer.length) {
-          head.append(
-              new String(buffer, 0, Math.min(read, buffer.length), StandardCharsets.ISO_8859_1));
+        if (head.length() < MAX_HEAD_BYTES) {
+          head.append(new String(buffer, 0, read, StandardCharsets.ISO_8859_1));
         }
         total += read;
         if (read < buffer.length) {
@@ -431,16 +441,18 @@ public final class SlowClients {
         }
         Thread.sleep(settings.tick());
       }
-      int status = status(head.toString());
-      return new Download(status == OK, total, Duration.ofNanos(System.nanoTime() - startNanos));
+      return new Download(
+          isComplete(head.toString(), total),
+          total,
+          Duration.ofNanos(System.nanoTime() - startNanos));
 ```
 
 - The read loop is the slow reader. `in.readNBytes(buffer, 0, buffer.length)` reads until the buffer is full (5,000 bytes) or the stream ends, and returns how many bytes it got. It returns 0 at the end of the stream.
-- The first bytes read are kept in `head` (while `head.length() < buffer.length`, so only the first chunk) to read the status line. `new String(buffer, 0, ..., ISO_8859_1)` turns bytes into text.
+- Every read is added to `head` until it holds `MAX_HEAD_BYTES`, so the status line and `Content-Length` are seen even when they arrive over many small reads; the comment says so. `new String(buffer, 0, read, ISO_8859_1)` turns the bytes that were read into text (ISO 8859-1 maps each byte to one character, so nothing is lost). The first version kept only the first read, so with `bytesPerTick` below the length of the status line every download counted as failed, even a good `200`.
 - `total` counts all bytes, headers included.
 - `if (read < buffer.length) break;` ends the loop: a short read means the stream ended.
 - `Thread.sleep(settings.tick())` is the pause. It is the slowness. With 5,000 bytes and 100 ms, the client reads at about 50,000 bytes per second, a little less because the read itself takes time.
-- After the loop, `status(head.toString())` reads the code. The result is complete (`status == OK`), the total, and the time since start. "Complete" means: status 200 and the connection reached its end. The code does not compare `total` with a `Content-Length` header.
+- After the loop, `isComplete(head.toString(), total)` (below) decides whether the download is complete. The `Download` holds that answer, the total and the time since start.
 
 ```java
     } catch (IOException failed) {
@@ -584,6 +596,25 @@ public final class SlowClients {
     return sorted.get(Math.max(rank, 1) - 1);
   }
 
+  /**
+   * Says whether a download read a whole 200 response: the status is 200, the head ended, and the
+   * body after it is exactly as long as Content-Length promised. A server that closes early, or a
+   * reply without a length (which this lab never sends), is not a complete download.
+   *
+   * @param head the first bytes of the response, at least the whole head
+   * @param total every byte read, head included
+   * @return true for a complete 200 response
+   */
+  static boolean isComplete(String head, long total) {
+    int headEnd = head.indexOf(HEAD_END);
+    if (status(head) != OK || headEnd < 0) {
+      return false;
+    }
+    Matcher length = CONTENT_LENGTH.matcher(head.substring(0, headEnd + HEAD_END.length()));
+    long bodyBytes = total - headEnd - HEAD_END.length();
+    return length.find() && Long.parseLong(length.group(1)) == bodyBytes;
+  }
+
   static int status(String head) {
     Matcher matcher = STATUS_LINE.matcher(head.lines().findFirst().orElse(""));
     return matcher.matches() ? Integer.parseInt(matcher.group(1)) : 0;
@@ -592,6 +623,7 @@ public final class SlowClients {
 
 - `percentile` is the nearest-rank rule on durations. It has no `private` so the test can call it.
 - `status(head)` takes the first line of the text (`head.lines().findFirst()`) and reads its code; 0 if it does not look like a status line. A head that is cut before the first line ends gives 0.
+- `isComplete(head, total)` is the rule of a complete download, in three checks. The status must be `200`. The head must have ended: `head.indexOf(HEAD_END)` finds the blank line, and `-1` means it never came. And the body must be exactly as long as `Content-Length` promised: the body is every byte after the blank line, `total - headEnd - HEAD_END.length()`, and the header is looked for only in the head, `head.substring(0, headEnd + HEAD_END.length())`, never in the body. A server that closes after part of the answer fails the last check, and so does a reply without `Content-Length` (this lab never sends one: SeatWave and NGINX's plain ports always give the length). The first version called a download complete when the status was 200 and the connection ended, so a server that promised 100,000 bytes, sent 20 and closed produced two "complete" downloads.
 
 ```java
   private static Download awaitDownload(Future<Download> download, long deadlineNanos)
@@ -706,8 +738,22 @@ public final class SlowClientsCli {
     if (loaded.isEmpty()) {
       return EXIT_BAD_USAGE;
     }
+    return runAndPrint(loaded.get(), out, err);
+  }
+
+  /**
+   * Runs the slow clients with checked settings and prints what they measured.
+   *
+   * @param settings the checked settings
+   * @param out where the results are printed
+   * @param err where problems are printed
+   * @return 0, or 1 if SeatWave's metrics could not be read
+   * @throws InterruptedException if the thread is interrupted while waiting
+   */
+  static int runAndPrint(SlowSettings settings, PrintStream out, PrintStream err)
+      throws InterruptedException {
     try {
-      print(loaded.get(), SlowClients.run(loaded.get()), out);
+      print(settings, SlowClients.run(settings), out);
       return 0;
     } catch (IOException failed) {
       err.println("the run stopped: " + failed.getMessage());
@@ -716,7 +762,7 @@ public final class SlowClientsCli {
   }
 ```
 
-- `run(arguments, out, err)` needs exactly one argument. `SettingsFiles.load(path, SlowSettings::from, err)` reads and checks, printing the problems on failure.
+- `run(arguments, out, err)` needs exactly one argument. `SettingsFiles.load(path, SlowSettings::from, err)` reads and checks, printing the problems on failure. The checked settings go to `runAndPrint`, which runs the clients and prints. It is package-private so `SlowClientsTest` can call it with settings that point at an in-process SeatWave; the settings file allows only the lab network's addresses.
 - `SlowClients.run(...)` can throw `IOException` if the metrics cannot be read before or after the run, or a side task does not finish: that prints `the run stopped: ...` and returns 1.
 
 ```java
@@ -737,7 +783,7 @@ public final class SlowClientsCli {
             + " max %.2f s%n",
         result.completed(),
         result.failed(),
-        result.bodyBytes(),
+        result.responseBytes(),
         seconds(result.downloadP50()),
         seconds(result.downloadMax()));
 ```
@@ -822,28 +868,28 @@ java -cp build/classes/java/main build/TrySlow.java 20 'http://127.0.0.1:20931/e
 The output (one line, wrapped here):
 
 ```text
-SlowResult[completed=20, failed=0, bodyBytes=37187, downloadP50=PT0.768083583S, downloadMax=PT0.772629333S,
-workersBusyMax=1, missedSamples=0, workers=64, workerSeconds=0.0071499999999993236,
-probeP50=PT0.003859833S, probeP99=PT0.005380041S, probeMax=PT0.005380041S, probes=8, probeFailures=0]
+SlowResult[completed=20, failed=0, responseBytes=37187, downloadP50=PT0.7391235S, downloadMax=PT0.7668865S,
+workersBusyMax=0, missedSamples=0, workers=64, workerSeconds=0.00821700000000014,
+probeP50=PT0.001999083S, probeP99=PT0.015098458S, probeMax=PT0.015098458S, probes=8, probeFailures=0]
 ```
 
-Read it. Twenty clients each downloaded 37,187 bytes (the 36,894-byte seat map and the headers) in about 0.77 s: 8 reads of 5,000 bytes with 100 ms between them is 0.7 s of pauses. `PT0.768S` is how Java prints a duration of 0.768 seconds.
+Read it. Twenty clients each downloaded 37,187 bytes (the 36,894-byte seat map and the head) in about 0.74 s: 8 reads of 5,000 bytes with 100 ms between them is 0.7 s of pauses. `PT0.739S` is how Java prints a duration of 0.739 seconds.
 
-The surprise is `workersBusyMax=1` and `workerSeconds=0.007`. On this Mac, SeatWave on the loopback address finished writing the 37 KB at once, so no worker stayed busy. The kernel's loopback buffers took the whole answer, even with the client's receive buffer set to 4,096 bytes. The lab needs a network where the small buffer holds the sender back, and the README's numbers come from the Docker virtual machine's Linux kernel (64 of 64 workers busy). On the writer's Mac the same program with 100 clients for the 300 KB poster also showed only 1 busy worker, with downloads of 6.4 s. The writer did not look into why the Mac behaves this way; treat it as a fact about this experiment, not as an explanation.
+The surprise is `workersBusyMax=0` and `workerSeconds=0.008`. On this Mac, SeatWave on the loopback address finished writing the 37 KB at once, so no worker stayed busy. The kernel's loopback buffers took the whole answer, even with the client's receive buffer set to 4,096 bytes. The lab needs a network where the small buffer holds the sender back, and the README's numbers come from the Docker virtual machine's Linux kernel (64 of 64 workers busy). On the first writer's Mac the same program with 100 clients for the 300 KB poster also showed only 1 busy worker, with downloads of 6.4 s. One fact fits: this Mac starts a TCP connection's send buffer at 128 KB (`sysctl net.inet.tcp.sendspace` printed `131072`) and lets it grow up to 4 MB (`net.inet.tcp.autosndbufmax: 4194304`), so the kernel can take a whole answer from the server at once. That a growing send buffer is the whole reason was not tested here; treat the busy numbers on a Mac as a fact about this experiment, and use the lab's Linux run for the lesson.
 
-**3. See a bad setting count every download as failed.** Ten bytes per tick is shorter than the status line `HTTP/1.1 200 OK` (15 characters), so the status cannot be read:
+**3. Read the answer ten bytes at a time.** Ten bytes per tick is shorter than the status line `HTTP/1.1 200 OK` (15 characters), so the head arrives over many reads:
 
 ```text
 java -cp build/classes/java/main build/TrySlow.java 2 'http://127.0.0.1:20931/health' 10
 ```
 
 ```text
-SlowResult[completed=0, failed=2, bodyBytes=0, downloadP50=PT0S, downloadMax=PT0S, workersBusyMax=1, missedSamples=0, workers=64, workerSeconds=0.0044500000000002867, probeP50=PT0.002118375S, probeP99=PT0.007532708S, probeMax=PT0.007532708S, probes=18, probeFailures=0]
+SlowResult[completed=2, failed=0, responseBytes=177, downloadP50=PT1.780168625S, downloadMax=PT1.780308333S, workersBusyMax=1, missedSamples=0, workers=64, workerSeconds=0.00417299999999976, probeP50=PT0.002665125S, probeP99=PT0.011709083S, probeMax=PT0.011709083S, probes=17, probeFailures=0]
 ```
 
-Both downloads got a `200` answer, and both were counted as failed.
+Both 177-byte answers were read over 18 reads, 1.78 s, and both count as complete. (Version 1.0.0 read the status only from the first 10 bytes and counted both as failed.)
 
-**4. See an incomplete download counted as complete.** A tiny server that promises 100,000 bytes, sends 20, and closes (save as `build/trunc.py`; it stops itself after 15 seconds without a connection):
+**4. See an incomplete download counted as failed.** A tiny server that promises 100,000 bytes, sends 20, and closes (save as `build/trunc.py`; it stops itself after 15 seconds without a connection):
 
 ```text
 import socket
@@ -868,10 +914,10 @@ java -cp build/classes/java/main build/TrySlow.java 2 'http://127.0.0.1:20983/x'
 ```
 
 ```text
-SlowResult[completed=2, failed=0, bodyBytes=63, downloadP50=PT0.004594959S, downloadMax=PT0.004725417S, workersBusyMax=0, ...
+SlowResult[completed=0, failed=2, responseBytes=0, downloadP50=PT0S, downloadMax=PT0S, workersBusyMax=0, missedSamples=0, workers=64, workerSeconds=1.3299999999993872E-4, probeP50=PT0.004980667S, probeP99=PT0.004980667S, probeMax=PT0.004980667S, probes=1, probeFailures=0]
 ```
 
-Two "complete" downloads of 63 bytes, though the server promised 100,000. (In this run the probe and the metrics also pointed at SeatWave, so the rest of the line is not the point.)
+Both downloads failed: each got 20 body bytes where `Content-Length` promised 100,000. (Version 1.0.0 called them two "complete" downloads of 63 bytes. In this run the probe and the metrics also pointed at SeatWave, so the rest of the line is not the point.)
 
 **5. Run the unit tests of this file.**
 
@@ -885,8 +931,8 @@ Stop SeatWave with Ctrl-C when you are done.
 
 - **Running the lab from the Mac.** Docker Desktop's port forwarder buffers on its own and hides what the proxy does. The lab runs inside the lab network.
 - **A receive buffer that the system ignores.** The program sets `SO_RCVBUF` before `connect`, but the system may round it up or, as the Try above shows, still buffer a whole small answer. Check that `workersBusyMax` is high on the "direct" run before you trust a "buffered" run.
-- **Too small a `bytesPerTick`.** Under about 15 bytes the status line is split across reads and every download counts as failed. Keep it at a few hundred bytes or more.
-- **Calling a short download a success.** A download is complete when the status is 200 and the stream ended. A server that dies mid-answer and closes cleanly still passes. Compare the bytes with the other runs of the same target: the README's rows all show the same byte count.
+- **Reading the status from the first read only.** With a small `bytesPerTick` the status line is split across reads. Collect the head across reads, as this code does, or every download of a slow-enough client looks failed.
+- **Calling a short download a success.** "Status 200 and the stream ended" is not enough: a server that dies mid-answer and closes cleanly passes it. Compare the body with `Content-Length`, as `isComplete` does.
 - **Reading the probe's p99 as a tail.** With 8 or 60 answers, p99 is the maximum, and a stalled probe stops sending more requests while it waits.
 - **Ignoring the missed readings.** `(0 readings missed)` tells you the busy numbers have no gaps. A larger number means the sampler was starved.
 

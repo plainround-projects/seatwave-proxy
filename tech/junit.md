@@ -110,6 +110,12 @@ class StackInvariantTest {
   private static final String METRICS = "http://127.0.0.1:20912/metrics";
   private static final String FORGED = "203.0.113.7";
   private static final Duration TIMEOUT = Duration.ofSeconds(10);
+  private static final int SEATS_PER_SECTION = 1_000;
+  private static final int CONFLICT = 409;
+  private static final int MAX_SEAT_ATTEMPTS = 50;
+  // A random first seat, so two runs within one hold's 300 s rarely start on the same seat.
+  private static final AtomicInteger NEXT_SEAT =
+      new AtomicInteger(new SplittableRandom().nextInt(SEATS_PER_SECTION));
   private static HttpClient client;
 
   @BeforeAll
@@ -123,13 +129,14 @@ class StackInvariantTest {
   }
 ```
 
+- The four constants under `TIMEOUT` and the `AtomicInteger` serve the helper that picks seats for the holds; `tests-stack-walkthrough.md` explains them.
 - `@Tag("stack")` on the class labels it. The build file uses the label in two places (`gradle.md`): `test` calls `excludeTags("stack")`, so `./gradlew check` never needs Docker, and `stackTest` calls `includeTags("stack")`, so only these six tests run against the running stack.
 - `@BeforeAll` marks a method that runs once before the first test of the class. `@AfterAll` marks one that runs once after the last. Both must be `static`, because no test instance exists yet when they run (JUnit creates a new instance for each test, as step 3 says). The class keeps one HTTP client in a `static` field, makes it once and closes it once. This is the only class that uses these two annotations.
 - The six tests of this class were not run for these notes: they need the Compose stack, and no Docker was started (`tests-stack-walkthrough.md`).
 
 ### What this repository does not use
 
-There is no `@ParameterizedTest`, `@ValueSource`, `@EnumSource`, `@Nested`, `@DisplayName`, `@Timeout`, `@Disabled` or `@ExtendWith`. I searched the test sources for each and found none. Where several inputs need one check, a test lists the checks one after another. Each test builds what it needs with ordinary helper methods. That keeps each test readable from top to bottom. A helper class holds no `@Test`, so JUnit ignores it.
+There is no `@ParameterizedTest`, `@ValueSource`, `@EnumSource`, `@Nested`, `@DisplayName`, `@Timeout`, `@Disabled` or `@ExtendWith`. I searched the test sources for each and found none. One relative is used: `@DisabledOnOs(value = OS.WINDOWS, disabledReason = "...")` from the package `org.junit.jupiter.api.condition` skips a test on Windows and prints the reason. Four tests carry it, in `ContainerCountersTest` and `BenchCliTest`, because they run a small `/bin/sh` script as a stand-in for `docker`, and Windows has no `/bin/sh` (`tests-tools-walkthrough-1.md`). Where several inputs need one check, a test lists the checks one after another. Each test builds what it needs with ordinary helper methods. That keeps each test readable from top to bottom. A helper class holds no `@Test`, so JUnit ignores it.
 
 There is also no `@Timeout`. A test that talks to a server never relies on JUnit to cut it off. Each wait carries its own bound instead: an `HttpClient` request timeout, a `Duration` limit in `await().atMost(TIMEOUT)`, or a timeout inside the call. A bound inside the call gives a clear error, where an outside timeout would only say that the test took too long.
 

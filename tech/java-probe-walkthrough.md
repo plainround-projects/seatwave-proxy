@@ -31,16 +31,19 @@ The Gradle task `probe` runs `ProbeCli`: `./gradlew -q probe --args='config/prob
 
 **Keep-alive.** The probe uses one `HttpClient`, so its requests reuse one connection to the proxy, as a busy browser tab does. When the proxy stops, that connection breaks and the next request has to connect again.
 
-**What "failure" looks like.** The Java HTTP client reports problems as exceptions. Four cases are told apart:
+**What "failure" looks like.** The Java HTTP client reports problems as exceptions. Five cases are told apart:
 
 | Result text | Meaning |
 |---|---|
 | `connection refused` | The operating system answered the connection attempt with a refusal: nothing listens on that port (the proxy is stopped). |
-| `connect timeout` | The connection did not come up within the connect timeout. The same text appears if the TCP connection is up but the TLS handshake does not finish. |
+| `connect timeout` (http) or `connect or TLS timeout` (https) | The connection did not come up within the connect timeout. For https the client's connect timeout also covers the TLS handshake, so a TCP connection that is up but gets no handshake answer looks the same, and the label says so. |
 | `request timeout` | The connection worked, but the whole answer did not arrive within the request timeout. |
-| `connection lost` | Anything else that is an input-output error: a connection closed or reset under the request, or a failed TLS handshake. |
+| `TLS failed` | The server answered, but not in TLS this client accepts: plain HTTP on the port, a certificate the TEST CA did not sign, or a refused handshake (an `SSLException`). |
+| `connection lost` | Any other input-output error: a connection closed or reset under the request. |
 
-**A span.** Consecutive outcomes with the same result form a **span**. A 30-second probe has 300 outcomes but, in the README's proxy outage, only four spans: before, a short "connection lost", the refusals, and after.
+(Version 1.0.0 had four texts: it reported a TLS failure as `connection lost` and every connect timeout as `connect timeout`.)
+
+**A span.** Consecutive outcomes with the same result form a **span**. A 30-second probe has 300 outcomes but, in the README's proxy outage measured with version 1.0.0, only four spans: before, a short "connection lost", the refusals, and after.
 
 **The outage.** The code defines the outage as the time from the first failed request to the first success after the last failed one. It uses the planned send times of those two requests, not the times the answers arrived.
 
@@ -90,12 +93,11 @@ public record ProbeSettings(
 ```java
   private static final Pattern LAB_URI =
       Pattern.compile("https?://127\\.0\\.0\\.1:209[0-9]{2}/[A-Za-z0-9/._?=&-]*");
-  private static final Pattern FILE = Pattern.compile("[A-Za-z0-9_./-]{1,200}");
   private static final int MAX_MILLIS = 600_000;
 ```
 
 - `LAB_URI` is the same allow-list as in the bench: `http` or `https`, the address `127.0.0.1`, a port from 20900 to 20999, and a path. A probe cannot be aimed at another host.
-- `FILE` allows a path of up to 200 characters of letters, digits and `_ . / -`.
+- The certificate file's path is read with the reader's `filePath` rule (any character but a control character, up to 4,096), so there is no file pattern here.
 - `MAX_MILLIS` is ten minutes, an upper bound for any time.
 
 ```java
@@ -121,7 +123,7 @@ public record ProbeSettings(
    */
   public static Result<ProbeSettings, List<String>> from(SettingsReader reader) {
     String uri = reader.textMatching("probe.uri", LAB_URI);
-    String authority = reader.textMatching("tls.authorityPem", FILE);
+    String authority = reader.filePath("tls.authorityPem");
     Duration interval = reader.millisBetween("probe.intervalMillis", 1, MAX_MILLIS);
     Duration duration = reader.millisBetween("probe.durationMillis", 1, MAX_MILLIS);
     Duration connect = reader.millisBetween("client.connectTimeoutMillis", 1, MAX_MILLIS);
@@ -277,7 +279,7 @@ public final class Timeline {
 - `outage(outcomes)` scans once and remembers the index of the first failure and of the last failure. A failure is any outcome that is not `isSuccess()`. `firstFailure < 0 ? index : firstFailure` keeps the first index it saw.
 - If nothing failed (`firstFailure < 0`), or the last outcome itself failed (`lastFailure == outcomes.size() - 1`: service never came back inside the probe), the answer is `Optional.empty()`.
 - Otherwise the outage is the planned send time of the outcome after the last failure, minus the send time of the first failure: `Duration.minus`.
-- Every failure counts, so an outage in two pieces is one long outage that includes the working time between its pieces. The README's proxy outage shows 10.502 s for a 10-second stop: a little more than the stop itself, because both ends are send times of requests, which are a fraction of a second apart from the stop and the start.
+- Every failure counts, so an outage in two pieces is one long outage that includes the working time between its pieces. The README's proxy outage (version 1.0.1's run) shows 10.400 s for a 10-second stop: a little more than the stop itself, because both ends are send times of requests, which are a fraction of a second apart from the stop and the start.
 
 ```java
   /**
@@ -306,21 +308,35 @@ public final class Timeline {
 - `span.first()` and `span.last()` are the first and last outcomes; `span.outcomes().size()` is how many.
 
 ```java
-    text.append(
-        outage(outcomes)
-            .map(duration ->
-                String.format(
-                    Locale.ROOT,
-                    "outage: %.3f s from the first failed request to the first success after"
-                        + " the last%n",
-                    seconds(duration)))
-            .orElse("outage: none that ended inside the probe" + System.lineSeparator()));
+    text.append(outageLine(outcomes)).append(System.lineSeparator());
     return text.toString();
+  }
+
+  private static String outageLine(List<Outcome> outcomes) {
+    Optional<Duration> outage = outage(outcomes);
+    if (outage.isPresent()) {
+      return String.format(
+          Locale.ROOT,
+          "outage: %.3f s from the first failed request to the first success after the last",
+          seconds(outage.get()));
+    }
+    // No ended outage has two causes, and the reader must be told which one it was.
+    Optional<Outcome> firstFailure =
+        outcomes.stream().filter(each -> !each.isSuccess()).findFirst();
+    return firstFailure
+        .map(failure ->
+            String.format(
+                Locale.ROOT,
+                "outage: from %.3f s to the end of the probe, with no success after it",
+                seconds(failure.sentAt())))
+        .orElse("outage: none, every request succeeded");
   }
 ```
 
-- The last line is the outage. `outage(outcomes).map(duration -> String.format(...))` turns the duration into text if there is one. `.orElse("outage: none that ended inside the probe" + lineSeparator)` is the text otherwise.
-- The "none" text is printed in two different situations: nothing failed, and service never came back. A probe that failed 100 percent of the time prints `outage: none that ended inside the probe` too (the Try section shows it).
+- The last line is the outage, made by `outageLine` and ended with the system's line separator.
+- `outageLine` first asks `outage(outcomes)`. If it holds a duration, the line gives it.
+- With no ended outage there are two very different cases, and the comment says the reader must be told which. `outcomes.stream().filter(each -> !each.isSuccess()).findFirst()` looks for the first failed request. If there is one, service never came back: the line says `outage: from <its send time> s to the end of the probe, with no success after it`. If there is none, the line says `outage: none, every request succeeded`. `.map(...)` turns a found failure into its text, and `.orElse(...)` gives the text for an empty `Optional`.
+- The first version printed one text, `outage: none that ended inside the probe`, for both cases, so a probe whose every request failed looked like a clean one at a glance.
 
 ```java
   private static double seconds(Duration duration) {
@@ -410,9 +426,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import javax.net.ssl.SSLException;
 ```
 
-- Imports include the four exception types the HTTP client can throw: `ConnectException` (`java.net`), and `HttpConnectTimeoutException` and `HttpTimeoutException` (`java.net.http`), plus `IOException`.
+- Imports include the exception types the HTTP client can throw: `ConnectException` (`java.net`), `HttpConnectTimeoutException` and `HttpTimeoutException` (`java.net.http`), `SSLException` (`javax.net.ssl`, a TLS failure), and `IOException`.
 
 ```java
 /**
@@ -465,10 +482,23 @@ public final class ProbeCli {
     if (loaded.isEmpty()) {
       return EXIT_BAD_USAGE;
     }
-    ProbeSettings settings = loaded.get();
+    return probeAndPrint(loaded.get(), out, err);
+  }
+
+  /**
+   * Runs the probe with checked settings and prints the timeline.
+   *
+   * @param settings the checked settings
+   * @param out where the timeline is printed
+   * @param err where problems are printed
+   * @return 0, or 2 if the certificate authority file cannot be used
+   * @throws InterruptedException if the thread is interrupted while waiting
+   */
+  static int probeAndPrint(ProbeSettings settings, PrintStream out, PrintStream err)
+      throws InterruptedException {
 ```
 
-- `run` needs exactly one argument. `SettingsFiles.load(path, ProbeSettings::from, err)` reads and checks the file, and prints the problems if there are any.
+- `run` needs exactly one argument. `SettingsFiles.load(path, ProbeSettings::from, err)` reads and checks the file, and prints the problems if there are any. Then it hands the checked settings to `probeAndPrint`, which does the rest. `probeAndPrint` is package-private so `ProbeCliTest` can call it with settings that point at an in-process SeatWave, which the settings file (ports 20900 to 20999 only) would not allow.
 
 ```java
     HttpClient client;
@@ -495,17 +525,17 @@ public final class ProbeCli {
     }
     out.printf(
         Locale.ROOT,
-        "probe: GET %s every %d ms for %d s, one client, HTTP/1.1 keep-alive%n",
+        "probe: GET %s every %d ms for %s, one client, HTTP/1.1 keep-alive%n",
         settings.uri(),
         settings.interval().toMillis(),
-        settings.duration().toSeconds());
+        wholeSecondsOrMillis(settings.duration()));
     out.print(Timeline.render(outcomes));
     return 0;
   }
 ```
 
 - `try (client) { outcomes = probe(client, settings); }` runs the loop and then closes the client.
-- The first printed line says what ran: the address, the interval in milliseconds and the duration in seconds (`duration().toSeconds()`, which drops the fraction: a probe of 500 ms prints "for 0 s"). Then `Timeline.render(outcomes)` prints the spans and the outage line. The function returns 0.
+- The first printed line says what ran: the address, the interval in milliseconds and the duration, written by `wholeSecondsOrMillis` (below): `for 30 s` for whole seconds, `for 500 ms` otherwise. (The first version printed `duration().toSeconds()`, which drops the fraction, so a probe of 500 ms said "for 0 s".) Then `Timeline.render(outcomes)` prints the spans and the outage line. The function returns 0.
 
 ```java
   /**
@@ -553,16 +583,34 @@ public final class ProbeCli {
 - `sentNanos` is the real send time. `send(client, request)` returns the result text. A new `Outcome` records the send time relative to the start, the text, and the elapsed time.
 
 ```java
+  private static String wholeSecondsOrMillis(Duration duration) {
+    // "for 30 s" as before for whole seconds, and "for 500 ms" instead of "for 0 s" otherwise.
+    return duration.toMillisPart() == 0 ? duration.toSeconds() + " s" : duration.toMillis() + " ms";
+  }
+```
+
+- `wholeSecondsOrMillis` writes a duration for the first line. `toMillisPart()` is the part below one second, from 0 to 999; when it is 0 the duration is whole seconds and is written as such, so the README's `for 30 s` stays the same. Otherwise it is written in milliseconds.
+
+```java
   private static String send(HttpClient client, HttpRequest request) throws InterruptedException {
     try {
       return Integer.toString(
           client.send(request, HttpResponse.BodyHandlers.discarding()).statusCode());
     } catch (HttpConnectTimeoutException slowConnect) {
-      return "connect timeout";
+      // HttpClient's connect timeout covers the TLS handshake too, so over https the two cannot be
+      // told apart, and the label says so.
+      return request.uri().getScheme().equals("https")
+          ? "connect or TLS timeout"
+          : "connect timeout";
     } catch (HttpTimeoutException slowAnswer) {
       return "request timeout";
     } catch (ConnectException refused) {
       return "connection refused";
+    } catch (SSLException tlsFailed) {
+      // The server answered, but not in TLS this client accepts: plain HTTP on the port, a
+      // certificate the TEST CA did not sign, or a refused handshake. The JDK client raises this
+      // type only for TLS's own errors; a broken connection is an ordinary IOException.
+      return "TLS failed";
     } catch (IOException broken) {
       // Any other failure: the connection closed or reset under the request.
       return "connection lost";
@@ -571,15 +619,20 @@ public final class ProbeCli {
 ```
 
 - `send` returns the status code as text if the request completed: `client.send(request, BodyHandlers.discarding()).statusCode()`. `discarding()` throws the body away. `Integer.toString` makes the number into text.
-- The four `catch` blocks map failures to texts, most specific first: `HttpConnectTimeoutException` (a kind of `HttpTimeoutException`) is "connect timeout"; `HttpTimeoutException` is "request timeout"; `ConnectException` is "connection refused"; any other `IOException` is "connection lost". If the more general `HttpTimeoutException` came first, the connect timeout would never be reached.
-- A failed TLS handshake or an untrusted certificate is an `SSLException`, a kind of `IOException`, so it is reported as "connection lost". A TLS handshake that gets no answer is reported as "connect timeout". The labels name what the client could see, not always the real cause.
+- The five `catch` blocks map failures to texts, most specific first. If a more general type came first, the specific one would never be reached (the compiler refuses that order).
+  - `HttpConnectTimeoutException` (a kind of `HttpTimeoutException`): the client's connect timeout ran out. In the JDK's client that timeout covers the TLS handshake too, so for an `https` address the two cannot be told apart, and the label is `connect or TLS timeout`; for `http` it is `connect timeout`. `request.uri().getScheme()` gives the scheme. The comment says so.
+  - `HttpTimeoutException`: "request timeout", the whole request took longer than the request timeout.
+  - `ConnectException`: "connection refused", nothing listens on the port.
+  - `SSLException` (`javax.net.ssl`): "TLS failed". It is raised for TLS's own errors: a server that answers in plain HTTP on the port, a certificate the TEST CA did not sign, or a refused handshake. A connection that breaks is an ordinary `IOException`, not this type, which is why it can have its own label.
+  - Any other `IOException`: "connection lost", the connection closed or reset under the request.
+- The first version had no `SSLException` block, so a failed handshake was reported as "connection lost", and its stalled handshake as plain "connect timeout". The labels still name what the client could see, which is not always the cause.
 - `InterruptedException` is not caught: it is declared with `throws` and ends the probe.
 
 ## Try it yourself
 
 All commands run in the repository folder. Numbers differ on every run and on every computer. The writer ran SeatWave on this machine; it did not run the Docker stack or `scripts/spof.sh`, so the outages below are made by hand, and the README's captured output stands for the real lab.
 
-**1. Start SeatWave on this machine.** In one terminal run `./gradlew -q testCertificates` and then `./gradlew -q serve --args='config/backend-local.properties'`. The writer used a copy of that file with the ports 20980 to 20982, because other work on the machine used the default ones, so every address below says 20980 where you would write 20930.
+**1. Start SeatWave on this machine.** In one terminal run `./gradlew -q testCertificates` and then `./gradlew -q serve --args='config/backend-local.properties'`. The outputs below are from a run of version 1.0.1 with those default ports, 20930 to 20932, while other programs kept the machine busy.
 
 **2. Make a short probe file.** Copy `config/probe.properties` to `build/probe-mine.properties` and change the address to `https://127.0.0.1:20930/health` and `probe.durationMillis` to `2000`. Run it:
 
@@ -588,49 +641,49 @@ All commands run in the repository folder. Numbers differ on every run and on ev
 ```
 
 ```text
-probe: GET https://127.0.0.1:20980/health every 100 ms for 2 s, one client, HTTP/1.1 keep-alive
-  0.000 s to   1.909 s  200                    x   20  latency p50     5.03 ms, max   193.15 ms
-outage: none that ended inside the probe
+probe: GET https://127.0.0.1:20930/health every 100 ms for 2 s, one client, HTTP/1.1 keep-alive
+  0.000 s to   1.904 s  200                    x   20  latency p50     2.42 ms, max   223.20 ms
+outage: none, every request succeeded
 ```
 
-Twenty requests, 2 s divided by 100 ms. The slowest (193 ms) is the first, which opened the connection and did the TLS handshake. The other 19 reused the connection.
+Twenty requests, 2 s divided by 100 ms. The slowest (223 ms) is the first, which opened the connection and did the TLS handshake. The other 19 reused the connection.
 
-**3. Make an outage by hand.** The server is paused (not stopped) with the signal `STOP` for three seconds, while an 8-second probe runs. In a third terminal, find the server's process id with `lsof -nP -iTCP:20930 -sTCP:LISTEN -t`, start the probe with `probe.durationMillis=8000` and, about 3 seconds later, run `kill -STOP <pid>` and 3 seconds after that `kill -CONT <pid>`. The writer ran the three steps from one command:
+**3. Make an outage by hand.** The server is paused (not stopped) with the signal `STOP` for three seconds, while an 8-second probe runs. In a third terminal, find the server's process id with `lsof -nP -iTCP:20930 -sTCP:LISTEN -t`, start the probe with `probe.durationMillis=8000` and, about 3 seconds later, run `kill -STOP <pid>` and 3 seconds after that `kill -CONT <pid>`. I ran the three steps from one command:
 
 ```text
 (sleep 3; kill -STOP $PID; sleep 3; kill -CONT $PID) & ./gradlew -q probe --args='build/probe-stop.properties'; wait
 ```
 
 ```text
-probe: GET https://127.0.0.1:20980/health every 100 ms for 8 s, one client, HTTP/1.1 keep-alive
-  0.000 s to   2.304 s  200                    x   24  latency p50     4.25 ms, max   157.16 ms
-  2.406 s to   2.406 s  request timeout        x    1  latency p50  1003.34 ms, max  1003.34 ms
-  3.409 s to   5.035 s  connect timeout        x    9  latency p50   202.65 ms, max   204.49 ms
-  5.237 s to   7.909 s  200                    x   46  latency p50     1.76 ms, max   166.50 ms
-outage: 2.831 s from the first failed request to the first success after the last
+probe: GET https://127.0.0.1:20930/health every 100 ms for 8 s, one client, HTTP/1.1 keep-alive
+  0.000 s to   1.905 s  200                    x   20  latency p50     2.80 ms, max   209.24 ms
+  2.010 s to   2.010 s  request timeout        x    1  latency p50  1003.69 ms, max  1003.69 ms
+  3.014 s to   4.629 s  connect or TLS timeout x    9  latency p50   202.02 ms, max   203.19 ms
+  4.832 s to   7.904 s  200                    x   50  latency p50     1.92 ms, max   154.24 ms
+outage: 2.822 s from the first failed request to the first success after the last
 ```
 
-Read it. The first request after the pause waited 1 s and timed out (`request timeout`, the open connection got no answer). The next ones could not finish a connection in 200 ms (`connect timeout`). The outage line says 2.831 s although the pause lasted 3 s, because it runs from the first failed request to the first success, using planned send times. The total is 24 + 1 + 9 + 46 = 80 requests, which is 8 s divided by 100 ms, even though the stretch after the outage has 46 answers in 2.7 s: the loop caught up.
+Read it. The first request after the pause waited 1 s and timed out (`request timeout`, the open connection got no answer). The next ones could not get through the connect timeout of 200 ms: `connect or TLS timeout`, because a paused process cannot answer a TLS handshake, while the kernel can still accept the TCP connection for it, and the client cannot tell which step stalled. The outage line says 2.822 s although the pause lasted 3 s, because it runs from the first failed request to the first success, using planned send times. The total is 20 + 1 + 9 + 50 = 80 requests, which is 8 s divided by 100 ms, even though the stretch after the outage has 50 answers in 3.1 s: the loop caught up.
 
 **4. Probe a port where nothing listens.** Change the port to 20999:
 
 ```text
 probe: GET https://127.0.0.1:20999/health every 100 ms for 2 s, one client, HTTP/1.1 keep-alive
-  0.000 s to   1.902 s  connection refused     x   20  latency p50     4.44 ms, max    24.54 ms
-outage: none that ended inside the probe
+  0.000 s to   1.906 s  connection refused     x   20  latency p50     2.29 ms, max    40.51 ms
+outage: from 0.000 s to the end of the probe, with no success after it
 ```
 
-All 20 requests failed, yet the last line says no outage "ended". The text is true (service never came back) but easy to misread.
+All 20 requests failed, and the last line says so: the outage began at 0.000 s and had not ended. (Version 1.0.0 printed `outage: none that ended inside the probe` here, which was true but easy to misread.)
 
-**5. Probe the plain HTTP port with HTTPS.** Port 20931 (20981 for the writer) speaks plain HTTP, so a TLS handshake never completes:
+**5. Probe the plain HTTP port with HTTPS.** Port 20931 speaks plain HTTP. The writer set the probe's duration to 500 ms:
 
 ```text
-probe: GET https://127.0.0.1:20981/health every 100 ms for 0 s, one client, HTTP/1.1 keep-alive
-  0.000 s to   0.836 s  connect timeout        x    5  latency p50   203.76 ms, max   225.27 ms
-outage: none that ended inside the probe
+probe: GET https://127.0.0.1:20931/health every 100 ms for 500 ms, one client, HTTP/1.1 keep-alive
+  0.000 s to   0.853 s  connect or TLS timeout x    5  latency p50   202.52 ms, max   245.87 ms
+outage: from 0.000 s to the end of the probe, with no success after it
 ```
 
-The writer set the probe's duration to 500 ms, and it was printed as "for 0 s", and the label says `connect timeout` although the TCP connection did succeed.
+The duration is printed as `500 ms` (version 1.0.0 printed `for 0 s`). The JDK's HTTP server on that port waits for a request line and never answers the TLS greeting, so every handshake runs into the connect timeout, and the label says that the stall may be in the TLS step. A server that does answer, but not in TLS, gives `TLS failed` instead; `ProbeCliTest` shows both with two small stand-in servers.
 
 **6. Run the unit tests of this package.**
 
@@ -644,8 +697,8 @@ Stop SeatWave with Ctrl-C afterwards.
 
 - **Sending as fast as possible during an outage.** A probe that does not keep a schedule changes the load while it measures. This one sends a fixed number of requests; late ones are sent at once, which is a burst after a stall.
 - **Reading only the failures.** The span lines also show the latency of the good requests. The first span's maximum (133 ms in the README's backend outage, against a median of 9.27 ms) is the first request, which opened the connection and did the TLS handshake.
-- **Reading "none that ended inside the probe" as "no failures".** It also means "service never came back". Look at the span lines.
-- **Trusting a label as a cause.** `connect timeout` can mean a stalled TLS handshake and `connection lost` can mean a rejected certificate.
+- **Reading one outage line without the spans.** The line says whether something failed and whether it ended, but the span lines show what failed and when.
+- **Trusting a label as a cause.** `connect or TLS timeout` cannot say which of the two steps stalled, and `TLS failed` covers a wrong port as well as an untrusted certificate.
 - **A probe that is too gentle or too long.** One request each 100 ms puts the outage's resolution at 100 ms; and a connect timeout longer than the interval makes the probe stall for each lost connection.
 - **Treating success as "any 2xx".** Only `200` counts. A health endpoint that answered `204` would be shown as down.
 
@@ -654,7 +707,7 @@ Stop SeatWave with Ctrl-C afterwards.
 1. How many requests does a 30-second probe with a 100 ms interval send, and why is it the same during an outage? (300; the loop is driven by the planned send times, so it always runs `duration / interval` times, catching up after slow requests.)
 2. Why must `HttpConnectTimeoutException` be caught before `HttpTimeoutException`? (The first is a kind of the second. The first matching `catch` wins, so the general one would hide the specific one; the compiler also refuses the reverse order.)
 3. What does the outage line measure? (The time from the first failed request's send time to the send time of the first success after the last failure.)
-4. What are the four failure texts? (`connect timeout`, `request timeout`, `connection refused`, `connection lost`.)
+4. What are the failure texts? (`connect timeout`, or `connect or TLS timeout` for https; `request timeout`; `connection refused`; `TLS failed`; `connection lost`.)
 5. Why does the probe exit 0 even when every request failed? (It records what happened; failures are the measurement. Only bad usage or settings give status 2.)
 
 ## Further reading

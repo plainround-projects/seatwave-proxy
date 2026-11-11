@@ -151,7 +151,7 @@ fi
 
 echo "plan: $action the Compose project $PROJECT"
 case "$action" in
-  up) echo "  ./gradlew -q stackPrepare; ${compose[*]} up -d --build; wait for $HEALTH_URL" ;;
+  up) echo "  ./gradlew -q stackPrepare; ${compose[*]} up -d --build --quiet-pull; wait for $HEALTH_URL" ;;
   down) echo "  ${compose_all[*]} down -v --remove-orphans; check nothing of $PROJECT is left" ;;
   test) echo "  up, then ./gradlew stackTest, then down -v (always)" ;;
 esac
@@ -171,7 +171,7 @@ audit() {
 ```
 
 - Lines 70 to 73: `status` runs `docker compose -p seatwave-proxy ps --all` and exits 0. It is read-only, so it needs no `--run`.
-- Line 75 prints the plan headline. Lines 76 to 80 print the commands the action would run. `${compose[*]}` (with `*`) joins the array into one string for printing.
+- Line 75 prints the plan headline. Lines 76 to 80 print the commands the action would run, exactly as `up` (below) runs them, `--quiet-pull` included; the first version's plan left that option out. `${compose[*]}` (with `*`) joins the array into one string for printing.
 - Lines 81 to 84: if `mode` is still `dry-run`, print that nothing changed and `exit 0`. This is the default.
 - Lines 85 to 88: unless `--yes` was given, ask. `read -r -p "Go ahead ...? [y/N] " answer < /dev/tty`: `read` stores what you type in `answer`; `-p` shows the prompt; `-r` stops it from treating backslashes specially; `< /dev/tty` reads from your terminal itself, not from the script's input, so `yes | scripts/stack.sh ...` cannot answer for you. Only the exact answer `y` goes on (`[[ "$answer" == "y" ]] || { ...; exit 1; }`); anything else, including a bare Enter, stops. When there is no terminal at all, the redirect fails and the script stops with exit code 1: I ran `scripts/stack.sh down --run < /dev/null` in a tool without a terminal and got `/dev/tty: Device not configured` and exit code 1.
 - Line 90 creates the folder for the log: `mkdir -p build/stack` (`-p` makes parent folders and does not complain if it exists).
@@ -185,7 +185,8 @@ up() {
   "${compose[@]}" up -d --build --quiet-pull
   audit "up: started $PROJECT"
   for (( waited = 0; waited < WAIT_SECONDS; waited++ )); do
-    if curl -s -o /dev/null --max-time 2 --cacert "$CA_FILE" "$HEALTH_URL"; then
+    # --fail: a 502 from the proxy while SeatWave is still starting is not "up".
+    if curl -s --fail -o /dev/null --max-time 2 --cacert "$CA_FILE" "$HEALTH_URL"; then
       echo "stack is up: $HEALTH_URL answered after ${waited} s"
       return 0
     fi
@@ -200,8 +201,8 @@ up() {
 - Line 96: `./gradlew -q stackPrepare` builds the jars and the TEST certificates (`gradle.md`; `-q` is quiet).
 - Line 97: `"${compose[@]}" up -d --build --quiet-pull`. `up` creates and starts the containers; `-d` runs them in the background (detached); `--build` builds the image first (`docker.md`); `--quiet-pull` hides the progress bars when an image has to be downloaded.
 - Line 98 writes the audit line.
-- Lines 99 to 105: a loop up to 60 times. `curl -s -o /dev/null --max-time 2 --cacert "$CA_FILE" "$HEALTH_URL"`: `-s` is silent, `-o /dev/null` throws the answer body away, `--max-time 2` gives each try at most 2 seconds, `--cacert` names the authority to trust. The `if` is true when curl succeeded in getting any HTTP answer. Then the script prints how long it waited and `return 0`. If not, it sleeps one second and tries again.
-- Lines 106 to 108: after 60 seconds, print an error and the last 40 lines of every container's log (`logs --tail 40`), both to standard error, and `return 1`.
+- Lines 99 to 106: a loop up to 60 times. Line 100 is a comment; line 101 is `curl -s --fail -o /dev/null --max-time 2 --cacert "$CA_FILE" "$HEALTH_URL"`: `-s` is silent, `-o /dev/null` throws the answer body away, `--max-time 2` gives each try at most 2 seconds, `--cacert` names the authority to trust. `--fail` makes curl fail on an HTTP error status, 400 or above. The comment says why it is needed: while SeatWave is still starting, the proxy is already up and answers `502`, and without `--fail` any answer, even that one, would count as "up". The first version had no `--fail`. The `if` is true when curl got a success status. Then the script prints how long it waited and `return 0`. If not, it sleeps one second and tries again.
+- Lines 107 to 109: after 60 seconds, print an error and the last 40 lines of every container's log (`logs --tail 40`), both to standard error, and `return 1`.
 
 ```bash
 down() {
@@ -220,10 +221,10 @@ down() {
 }
 ```
 
-- Line 112: `"${compose_all[@]}" down -v --remove-orphans`. `down` stops and removes the project's containers and network. `-v` also removes its volumes. `--remove-orphans` removes containers of the project that are no longer in the file.
-- Line 113 writes the audit line.
-- Lines 114 to 118: the **check after**. `local left` declares a variable, and line 116 assigns `left="$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")"`: all containers, running or not (`-a`), as bare ids (`-q`), that carry the project's label. Lines 117 and 118 append (`+=`) the networks and the volumes with the same label. Declaring `local` on its own line matters: `local x=$(cmd)` hides the command's exit code from `set -e`.
-- Lines 119 to 122: if anything was found, print it and `return 1`. Line 123 prints the success message.
+- Line 113: `"${compose_all[@]}" down -v --remove-orphans`. `down` stops and removes the project's containers and network. `-v` also removes its volumes. `--remove-orphans` removes containers of the project that are no longer in the file.
+- Line 114 writes the audit line.
+- Lines 115 to 119: the **check after**. `local left` declares a variable, and line 117 assigns `left="$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")"`: all containers, running or not (`-a`), as bare ids (`-q`), that carry the project's label. Lines 118 and 119 append (`+=`) the networks and the volumes with the same label. Declaring `local` on its own line matters: `local x=$(cmd)` hides the command's exit code from `set -e`.
+- Lines 120 to 123: if anything was found, print it and `return 1`. Line 124 prints the success message.
 
 ```bash
 case "$action" in
@@ -238,8 +239,8 @@ case "$action" in
 esac
 ```
 
-- Lines 126 to 135: the last `case` runs the chosen action: `up) up ;;` calls the function `up`, and `down) down ;;` calls `down`.
-- The `test)` branch is the interesting one. Line 131, `trap 'down' EXIT`, registers `down` to run when the script ends by **any** route: normal end, a failed command under `set -e`, or Ctrl-C. Then it runs `up`, then `./gradlew stackTest`. If a test fails, `set -e` stops the script and the trap still brings the stack down.
+- Lines 127 to 136: the last `case` runs the chosen action: `up) up ;;` calls the function `up`, and `down) down ;;` calls `down`.
+- The `test)` branch is the interesting one. Line 132, `trap 'down' EXIT`, registers `down` to run when the script ends by **any** route: normal end, a failed command under `set -e`, or Ctrl-C. Then it runs `up`, then `./gradlew stackTest`. If a test fails, `set -e` stops the script and the trap still brings the stack down.
 
 ### `scripts/spof.sh`: header, arguments and the plan
 
@@ -296,28 +297,31 @@ compose=(docker compose -p "$PROJECT")
 ### `scripts/spof.sh`: check before, plan, dry run, question
 
 ```bash
-# Check before: the service must be running.
-"${compose[@]}" ps --status running --services 2> /dev/null | grep -qx "$service" \
-  || { echo "the $service of $PROJECT is not running: run scripts/stack.sh up --run first" >&2; exit 1; }
-
 if [[ "$action" == "reload" ]]; then
   echo "plan: probe https://127.0.0.1:20900/health for 30 s; nginx -t and nginx -s reload at ${STOP_AFTER_SECONDS} s and again 5 s later"
 else
   echo "plan: probe https://127.0.0.1:20900/health for 30 s; stop $service at ${STOP_AFTER_SECONDS} s, start it at $(( STOP_AFTER_SECONDS + DOWN_FOR_SECONDS )) s"
 fi
+# Check before: the service must be running. A dry run only says so, because it changes nothing.
+is_running="yes"
+"${compose[@]}" ps --status running --services 2> /dev/null | grep -qx "$service" || is_running="no"
 if [[ "$mode" == "dry-run" ]]; then
+  [[ "$is_running" == "yes" ]] || echo "note: the $service of $PROJECT is not running now; start it with scripts/stack.sh up --run"
   echo "dry run: nothing changed. Add --run to do it."
   exit 0
 fi
+[[ "$is_running" == "yes" ]] \
+  || { echo "the $service of $PROJECT is not running: run scripts/stack.sh up --run first" >&2; exit 1; }
 if [[ "$confirmed" != "yes" ]]; then
   read -r -p "Go ahead with '$action' on $service of $PROJECT? [y/N] " answer < /dev/tty
   [[ "$answer" == "y" ]] || { echo "not confirmed; nothing changed" >&2; exit 1; }
 fi
 ```
 
-- Line 40: `"${compose[@]}" ps --status running --services 2> /dev/null | grep -qx "$service"`. `ps --status running --services` prints the names of the running services, one per line. The pipe sends them to `grep -qx "$service"`: `-q` quiet (only the exit code), `-x` the whole line must equal the word. So the check passes only if that service is running. Otherwise, line 41 prints `the <service> of seatwave-proxy is not running: run scripts/stack.sh up --run first` and exits 1. This check runs even in a dry run, so a dry run with the stack down exits 1 (I ran it).
-- Lines 43 to 47: print the plan. `$(( STOP_AFTER_SECONDS + DOWN_FOR_SECONDS ))` is arithmetic: 5 + 10 = 15, "start it at 15 s".
-- Lines 48 to 55: the dry-run exit and the question, as in `stack.sh`.
+- Lines 39 to 43: print the plan. `$(( STOP_AFTER_SECONDS + DOWN_FOR_SECONDS ))` is arithmetic: 5 + 10 = 15, "start it at 15 s".
+- Line 44 is a comment, and lines 45 and 46 check whether the service runs. `"${compose[@]}" ps --status running --services 2> /dev/null | grep -qx "$service"`: `ps --status running --services` prints the names of the running services, one per line. The pipe sends them to `grep -qx "$service"`: `-q` quiet (only the exit code), `-x` the whole line must equal the word. If that fails, `|| is_running="no"` records it; the check itself never stops the script.
+- Lines 47 to 51: a dry run prints a note when the service is not running, then `dry run: nothing changed`, and exits 0. A dry run changes nothing, so it does not fail either; the first version made the check first and exited 1 in a dry run with the stack down.
+- Lines 52 and 53: a real run stops here if the service is not running, with `the <service> of seatwave-proxy is not running: run scripts/stack.sh up --run first` and exit status 1. Lines 54 to 57: the question, as in `stack.sh`.
 
 ### `scripts/spof.sh`: the audit log and the safety net
 
@@ -340,12 +344,12 @@ probe=$!
 sleep "$STOP_AFTER_SECONDS"
 ```
 
-- Lines 57 to 60: the folder and the `audit()` function. The line starts with `spof:` so it is easy to tell from `stack.sh`'s lines in the same file.
-- Lines 61 and 62 are a comment: the service is started again on every path out of the script, even if the probe fails. The sidecar lives in SeatWave's network namespace, so it must restart with SeatWave to have one.
-- Lines 63 to 66: `restore()` runs `docker compose ... start "$service"` with all output discarded and `|| true`, so it never fails. Line 65: if the service was `backend`, it also restarts the sidecar. The shape `[[ ... ]] && cmd || true` means: if the test is true run `cmd`; whatever happens, finish with success.
-- Line 67: `trap restore EXIT` runs `restore` whenever the script ends: on success, on error, or on Ctrl-C.
-- Line 69: `log_lines_before=$( ... )`. It counts the lines the proxy's log has now: `logs --no-log-prefix proxy 2>&1 | wc -l | tr -d ' '`. `wc -l` counts lines; on macOS it pads the number with spaces and `tr -d ' '` deletes the spaces. Later the script prints only lines after this point.
-- Line 70: `./gradlew -q probe --args='config/probe.properties' > build/stack/probe-"$action".txt &`. It runs the probe task (`java-probe-walkthrough.md`) in the background (`&`), writing its output to a file named after the action. Line 71, `probe=$!`, remembers its process number. Line 72: `sleep 5` lets the probe collect five seconds of normal answers before anything is disturbed.
+- Lines 59 to 62: the folder and the `audit()` function. The line starts with `spof:` so it is easy to tell from `stack.sh`'s lines in the same file.
+- Lines 63 and 64 are a comment: the service is started again on every path out of the script, even if the probe fails. The sidecar lives in SeatWave's network namespace, so it must restart with SeatWave to have one.
+- Lines 65 to 68: `restore()` runs `docker compose ... start "$service"` with all output discarded and `|| true`, so it never fails. Line 67: if the service was `backend`, it also restarts the sidecar. The shape `[[ ... ]] && cmd || true` means: if the test is true run `cmd`; whatever happens, finish with success.
+- Line 69: `trap restore EXIT` runs `restore` whenever the script ends: on success, on error, or on Ctrl-C.
+- Line 71: `log_lines_before=$( ... )`. It counts the lines the proxy's log has now: `logs --no-log-prefix proxy 2>&1 | wc -l | tr -d ' '`. `wc -l` counts lines; on macOS it pads the number with spaces and `tr -d ' '` deletes the spaces. Later the script prints only lines after this point.
+- Line 72: `./gradlew -q probe --args='config/probe.properties' > build/stack/probe-"$action".txt &`. It runs the probe task (`java-probe-walkthrough.md`) in the background (`&`), writing its output to a file named after the action. Line 73, `probe=$!`, remembers its process number. Line 74: `sleep 5` lets the probe collect five seconds of normal answers before anything is disturbed.
 
 ### `scripts/spof.sh`: the reload round, the stop and the report
 
@@ -373,17 +377,24 @@ cat build/stack/probe-"$action".txt
 if [[ "$service" == "backend" ]]; then
   "${compose[@]}" restart sidecar > /dev/null 2>&1
   new_errors=$("${compose[@]}" logs --no-log-prefix proxy 2>&1 | tail -n +"$(( log_lines_before + 1 ))" | grep -E '\[error\].*GET /health' || true)
-  echo "the proxy logged $(printf '%s' "$new_errors" | grep -c . || true) error line(s) for /health while SeatWave was down; the first and the last:"
-  printf '%s\n' "$new_errors" | sed -n '1p;$p' | sed 's/^[0-9/]* [0-9:]* //'
+  error_count=$(printf '%s' "$new_errors" | grep -c . || true)
+  if (( error_count > 1 )); then
+    echo "the proxy logged $error_count error lines for /health while SeatWave was down; the first and the last:"
+  else
+    echo "the proxy logged $error_count error line(s) for /health while SeatWave was down:"
+  fi
+  # The first line, and the last one only if it is another line.
+  printf '%s\n' "$new_errors" | sed -n '1p;1!{$p;}' | sed 's/^[0-9/]* [0-9:]* //'
 fi
 ```
 
-- Lines 73 to 83 are the `reload` path. `for round in 1 2; do ... done` runs twice. Line 75: `docker exec "$PROJECT-proxy-1" nginx -t 2>&1 | sed 's/^/  /'` runs the configuration check inside the proxy container (`nginx.md`) and indents each output line with two spaces (`sed 's/^/  /'` replaces the start of a line with two spaces). Line 76: `nginx -s reload` tells NGINX to reload. Line 77 audits it, line 78 waits five seconds. Line 80, `wait "$probe"`, waits for the probe to finish (30 s in all). Line 81 prints the probe's report. Line 82, `exit 0`, ends the script; the trap runs `restore` (harmless).
-- Line 84: `stopped_at=$(date -u +%H:%M:%S)` notes the time for the report.
-- Line 85: `"${compose[@]}" stop "$service"` stops the container. Line 86 audits. Line 87: `sleep "$DOWN_FOR_SECONDS"`. Line 88: `start`. Line 89 audits. Line 90: wait for the probe.
-- Lines 91 and 92: print when and for how long, then the probe's report.
-- Lines 93 to 98 run only when the service was `backend`. Line 94 restarts the sidecar so it joins the new SeatWave network namespace. Line 95: `new_errors=$( ... )`. `logs --no-log-prefix proxy 2>&1` gets the log, `tail -n +"$(( log_lines_before + 1 ))"` keeps the lines after the earlier count, and `grep -E '\[error\].*GET /health' || true` keeps the error lines for `/health` (`-E` is extended patterns; `\[` is a literal bracket; `|| true` keeps `set -e` quiet when nothing matches).
-- Line 96: `printf '%s' "$new_errors" | grep -c . || true` counts the lines; `grep -c .` counts lines that have at least one character. Line 97 prints the first and the last of them: `sed -n '1p;$p'` prints line 1 and the last line (`$` means last), and `sed 's/^[0-9/]* [0-9:]* //'` strips NGINX's date and time from the start.
+- Lines 75 to 85 are the `reload` path. `for round in 1 2; do ... done` runs twice. Line 77: `docker exec "$PROJECT-proxy-1" nginx -t 2>&1 | sed 's/^/  /'` runs the configuration check inside the proxy container (`nginx.md`) and indents each output line with two spaces (`sed 's/^/  /'` replaces the start of a line with two spaces). Line 78: `nginx -s reload` tells NGINX to reload. Line 79 audits it, line 78 waits five seconds. Line 82, `wait "$probe"`, waits for the probe to finish (30 s in all). Line 83 prints the probe's report. Line 84, `exit 0`, ends the script; the trap runs `restore` (harmless).
+- Line 86: `stopped_at=$(date -u +%H:%M:%S)` notes the time for the report.
+- Line 87: `"${compose[@]}" stop "$service"` stops the container. Line 88 audits. Line 89: `sleep "$DOWN_FOR_SECONDS"`. Line 90: `start`. Line 91 audits. Line 92: wait for the probe.
+- Lines 93 and 94: print when and for how long, then the probe's report.
+- Lines 95 to 106 run only when the service was `backend`. Line 96 restarts the sidecar so it joins the new SeatWave network namespace. Line 97: `new_errors=$( ... )`. `logs --no-log-prefix proxy 2>&1` gets the log, `tail -n +"$(( log_lines_before + 1 ))"` keeps the lines after the earlier count, and `grep -E '\[error\].*GET /health' || true` keeps the error lines for `/health` (`-E` is extended patterns; `\[` is a literal bracket; `|| true` keeps `set -e` quiet when nothing matches).
+- Line 98: `error_count=$(printf '%s' "$new_errors" | grep -c . || true)` counts the lines; `grep -c .` counts lines that have at least one character. Lines 99 to 103 print a heading that fits the count: "the first and the last" only when there are two or more lines. `(( error_count > 1 ))` is a test in arithmetic, true when the count is above 1.
+- Line 104 is a comment, and line 105 prints the first line, and the last only if it is another line: `sed -n '1p;1!{$p;}'`. `-n` prints nothing unless told; `1p` prints line 1; `1!{...}` runs the commands in braces on every line except line 1, and there `$p` prints the last line (`$` means last). So a single error line is printed once. `sed 's/^[0-9/]* [0-9:]* //'` then strips NGINX's date and time from the start. The first version printed `1p;$p`, which shows a single line twice, under a heading that promised a first and a last line.
 
 ### `scripts/curl-timings.sh`: header, constants and arguments
 
@@ -450,7 +461,8 @@ done
 # Check before: the tool, the inputs and the output.
 command -v curl >/dev/null || { echo "curl is not installed" >&2; exit 1; }
 [[ -f "$targets_file" ]] || { echo "no targets file: $targets_file" >&2; exit 2; }
-[[ "$runs" =~ ^[0-9]+$ ]] && (( runs >= 1 && runs <= MAX_RUNS )) \
+# No leading zero: bash would read "08" as a broken octal number and "010" as 8.
+[[ "$runs" =~ ^[1-9][0-9]*$ ]] && (( runs <= MAX_RUNS )) \
   || { echo "runs must be 1 to $MAX_RUNS" >&2; exit 2; }
 [[ ! -e "$out_file" ]] || { echo "refusing to overwrite $out_file" >&2; exit 2; }
 
@@ -458,7 +470,8 @@ names=()
 urls=()
 cacerts=()
 encodings=()
-while read -r name url cacert encoding extra; do
+# "|| [[ -n ... ]]" also reads a last line that has no line break after it.
+while read -r name url cacert encoding extra || [[ -n "${name:-}" ]]; do
   [[ -z "${name:-}" || "$name" == \#* ]] && continue
   [[ -z "${extra:-}" ]] || { echo "too many fields for $name" >&2; exit 2; }
   [[ "$name" =~ $NAME_PATTERN ]] || { echo "invalid name: $name" >&2; exit 2; }
@@ -480,18 +493,18 @@ done < "$targets_file"
 
 - Line 50: `command -v curl >/dev/null || { echo "curl is not installed" >&2; exit 1; }`.
 - Line 51: `[[ -f "$targets_file" ]]`: `-f` is true for an existing regular file; otherwise exit 2.
-- Lines 52 and 53: the runs must be a number from 1 to 50. `[[ "$runs" =~ ^[0-9]+$ ]]` tests the text against a regular expression (one or more digits). `&& (( runs >= 1 && runs <= MAX_RUNS ))` is an arithmetic test. The `\` at the end of line 52 continues the command. `|| { ...; exit 2; }` stops with a message if either test failed.
-- Line 54: `[[ ! -e "$out_file" ]]`: `-e` is "exists" and `!` negates. The script **refuses to overwrite** an earlier result.
-- Lines 56 to 59: four empty arrays, one per field of a target.
-- Lines 60 to 76: the loop. `while read -r name url cacert encoding extra; do ... done < "$targets_file"` reads the file line by line. `read` splits a line on spaces into the five variables (the last one, `extra`, catches anything left over). `< "$targets_file"` feeds the file to the loop.
-  - Line 61: skip blank lines and comments: `[[ -z "${name:-}" || "$name" == \#* ]] && continue`. `-z` is "empty"; `${name:-}` is "the value, or empty if unset", needed because of `set -u`; `\#*` is a pattern for "starts with #"; `continue` goes to the next line.
-  - Line 62: more than four fields means a mistake: `too many fields for <name>`.
-  - Line 63: the name must match `NAME_PATTERN`. Note `$NAME_PATTERN` is on the right of `=~` and unquoted, so it is used as a pattern.
-  - Lines 64 and 65: the URL must match `LAB_PATTERN`, or the script refuses with `not an allowed target (127.0.0.1, ports 20900 to 20999)`.
-  - Lines 66 to 69: if a CA file is named it must exist, else the message says to run `./gradlew testCertificates`.
-  - Lines 70 and 71: the fourth field may only be `gzip`.
-  - Lines 72 to 75: `names+=("$name")` appends to an array; `"${cacert:-}"` stores an empty string when the field is missing.
-- Line 77: `(( ${#names[@]} > 0 )) || ...`: at least one target must have been read.
+- Line 52 is a comment, and lines 53 and 54 check that the runs are a number from 1 to 50. `[[ "$runs" =~ ^[1-9][0-9]*$ ]]` tests the text against a regular expression: a digit from 1 to 9, then any digits, so no leading zero. `&& (( runs <= MAX_RUNS ))` is an arithmetic test. The comment says why the leading zero is refused: inside `(( ... ))` Bash reads a number that starts with 0 as **octal** (base 8), so `010` would be 8 and `08` an error. The first version allowed any digits, accepted `010` as 8 runs and printed `value too great for base` for `08` before its own message. The `\` at the end of line 53 continues the command. `|| { ...; exit 2; }` stops with a message if either test failed.
+- Line 55: `[[ ! -e "$out_file" ]]`: `-e` is "exists" and `!` negates. The script **refuses to overwrite** an earlier result.
+- Lines 57 to 60: four empty arrays, one per field of a target.
+- Line 61 is a comment, and lines 62 to 78 are the loop. `while read -r name url cacert encoding extra || [[ -n "${name:-}" ]]; do ... done < "$targets_file"` reads the file line by line. `read` fails at the end of the file, and also on a last line that has no line break after it, even though it did fill the variables. `|| [[ -n "${name:-}" ]]` keeps such a last line: the loop goes on if `read` filled `name`. The first version had no such test and silently dropped the last target of a file without a final line break. `read` splits a line on spaces into the five variables (the last one, `extra`, catches anything left over). `< "$targets_file"` feeds the file to the loop.
+  - Line 63: skip blank lines and comments: `[[ -z "${name:-}" || "$name" == \#* ]] && continue`. `-z` is "empty"; `${name:-}` is "the value, or empty if unset", needed because of `set -u`; `\#*` is a pattern for "starts with #"; `continue` goes to the next line.
+  - Line 64: more than four fields means a mistake: `too many fields for <name>`.
+  - Line 65: the name must match `NAME_PATTERN`. Note `$NAME_PATTERN` is on the right of `=~` and unquoted, so it is used as a pattern.
+  - Lines 66 and 67: the URL must match `LAB_PATTERN`, or the script refuses with `not an allowed target (127.0.0.1, ports 20900 to 20999)`.
+  - Lines 68 to 71: if a CA file is named it must exist, else the message says to run `./gradlew testCertificates`.
+  - Lines 72 and 73: the fourth field may only be `gzip`.
+  - Lines 74 to 77: `names+=("$name")` appends to an array; `"${cacert:-}"` stores an empty string when the field is missing.
+- Line 79: `(( ${#names[@]} > 0 )) || ...`: at least one target must have been read.
 
 ### `scripts/curl-timings.sh`: the plan, the curl format, the dry run
 
@@ -526,11 +539,11 @@ if [[ "$confirmed" != "yes" ]]; then
 fi
 ```
 
-- Lines 79 and 80: `per_run=1`, and `per_run=2` with `--reuse` (two fetches per run). Line 81: `expected_lines=$(( ${#names[@]} * runs * per_run ))`: targets times runs times fetches. This is how many lines the output must have.
-- Lines 82 to 85: print the plan. `for index in "${!names[@]}"` goes over the positions of the array. `${names[$index]}` is the item at a position. `${encodings[$index]:+  (gzip)}` prints `  (gzip)` only if that item is not empty.
-- Lines 87 to 94: `timing_format()` prints curl's `-w` (write-out) format. Each `printf` line adds a part. `%%{time_namelookup}` in the `printf` becomes `%{time_namelookup}` for curl: in `printf`, `%%` prints a single `%`. The first `%s` is the target's name. Curl fills in the fields: time to look up the name (`dns`), to connect, to finish TLS (`tls`), to the first byte (`ttfb`), in total, the HTTP version, the status code, the downloaded size, the number of new connections, and three response headers (`content-encoding`, `x-cache-status`, `server-timing`). Line 88 notes why the `Server-Timing` header is last: it may contain spaces. `\\n` in single quotes becomes `\n` for curl, which curl turns into a new line. One request is one line.
-- Lines 96 to 101: in a dry run, print the plan and the exact curl command (with `NAME` and `URL` as placeholders), then `exit 0`. Nothing was sent.
-- Lines 103 to 106: the question, as in `stack.sh`. The prompt says how many requests will be sent.
+- Lines 81 and 82: `per_run=1`, and `per_run=2` with `--reuse` (two fetches per run). Line 83: `expected_lines=$(( ${#names[@]} * runs * per_run ))`: targets times runs times fetches. This is how many lines the output must have.
+- Lines 84 to 87: print the plan. `for index in "${!names[@]}"` goes over the positions of the array. `${names[$index]}` is the item at a position. `${encodings[$index]:+  (gzip)}` prints `  (gzip)` only if that item is not empty.
+- Lines 89 to 96: `timing_format()` prints curl's `-w` (write-out) format. Each `printf` line adds a part. `%%{time_namelookup}` in the `printf` becomes `%{time_namelookup}` for curl: in `printf`, `%%` prints a single `%`. The first `%s` is the target's name. Curl fills in the fields: time to look up the name (`dns`), to connect, to finish TLS (`tls`), to the first byte (`ttfb`), in total, the HTTP version, the status code, the downloaded size, the number of new connections, and three response headers (`content-encoding`, `x-cache-status`, `server-timing`). Line 90 notes why the `Server-Timing` header is last: it may contain spaces. `\\n` in single quotes becomes `\n` for curl, which curl turns into a new line. One request is one line.
+- Lines 98 to 103: in a dry run, print the plan and the exact curl command (with `NAME` and `URL` as placeholders), then `exit 0`. Nothing was sent.
+- Lines 105 to 108: the question, as in `stack.sh`. The prompt says how many requests will be sent.
 
 ### `scripts/curl-timings.sh`: send, then check after
 
@@ -560,10 +573,10 @@ fi
 echo "wrote $written lines to $out_file; audit line added to $audit_file"
 ```
 
-- Lines 108 and 109: create the output folder (`dirname "$out_file"`) and name the audit file in it.
-- Lines 110 to 121: for each target, build the curl command in an array. Line 113: `arguments=(-sS --connect-timeout ... --max-time ...)`. `-sS` means silent (no progress meter) but still show errors. Line 114: add `--cacert <file>` if the target has a CA file. Line 115: add `-H "Accept-Encoding: gzip"` if it asks for gzip. Line 116: add `-w "<format>" -o /dev/null "$url"`: the format, discard the body, the URL. Line 117: with `--reuse` add `-o /dev/null "$url"` again, so curl fetches the URL a second time on the same connection (curl keeps the connection open between the two URLs of one command).
-- Lines 118 to 120: `for (( run = 1; run <= runs; run++ ))` runs curl `runs` times, each time appending its line to the output: `curl "${arguments[@]}" >> "$out_file"`. If curl fails, `set -e` stops the script with curl's exit code.
-- Lines 123 to 130: **check after**. `written=$(wc -l < "$out_file" | tr -d ' ')` counts the lines written. Line 125 appends an audit line to `audit.log` next to the output, with the time, the number of requests and the file. Lines 126 to 129: if the count is not what was expected, print both numbers and `exit 1`. Line 130 prints the success message.
+- Lines 110 and 111: create the output folder (`dirname "$out_file"`) and name the audit file in it.
+- Lines 112 to 123: for each target, build the curl command in an array. Line 115: `arguments=(-sS --connect-timeout ... --max-time ...)`. `-sS` means silent (no progress meter) but still show errors. Line 116: add `--cacert <file>` if the target has a CA file. Line 117: add `-H "Accept-Encoding: gzip"` if it asks for gzip. Line 118: add `-w "<format>" -o /dev/null "$url"`: the format, discard the body, the URL. Line 119: with `--reuse` add `-o /dev/null "$url"` again, so curl fetches the URL a second time on the same connection (curl keeps the connection open between the two URLs of one command).
+- Lines 120 to 122: `for (( run = 1; run <= runs; run++ ))` runs curl `runs` times, each time appending its line to the output: `curl "${arguments[@]}" >> "$out_file"`. If curl fails, `set -e` stops the script with curl's exit code.
+- Lines 125 to 132: **check after**. `written=$(wc -l < "$out_file" | tr -d ' ')` counts the lines written. Line 127 appends an audit line to `audit.log` next to the output, with the time, the number of requests and the file. Lines 128 to 131: if the count is not what was expected, print both numbers and `exit 1`. Line 132 prints the success message.
 
 ### `scripts/hop-timings.sh`
 
@@ -590,7 +603,8 @@ readonly PROXY_URL="http://127.0.0.1:8080/events/1/seats?section=A"
 [[ $# -ge 2 ]] || { echo "usage: $0 <runs> <output file> [--run]" >&2; exit 2; }
 runs="$1"
 out_file="$2"
-[[ "$runs" =~ ^[0-9]+$ ]] && (( runs >= 1 && runs <= MAX_RUNS )) \
+# No leading zero: bash would read "08" as a broken octal number and "010" as 8.
+[[ "$runs" =~ ^[1-9][0-9]*$ ]] && (( runs <= MAX_RUNS )) \
   || { echo "runs must be 1 to $MAX_RUNS" >&2; exit 2; }
 [[ ! -e "$out_file" ]] || { echo "refusing to overwrite $out_file" >&2; exit 2; }
 format='%s dns=%%{time_namelookup} connect=%%{time_connect} tls=%%{time_appconnect} ttfb=%%{time_starttransfer} total=%%{time_total} http=%%{http_version} code=%%{http_code} size=%%{size_download} connects=%%{num_connects} server=%%header{server-timing}\\n'
@@ -599,8 +613,8 @@ format='%s dns=%%{time_namelookup} connect=%%{time_connect} tls=%%{time_appconne
 - Lines 1 to 12 are comments. The extra hop is measured **inside** the Docker virtual machine, without Docker Desktop's port forwarder in the path. The curl inside the proxy's own container asks SeatWave directly (`10.209.9.20:8080`) and through the proxy on its loopback address (`127.0.0.1:8080`). Both use the same curl, the same request and Module 5's `-w` format, so the report task can read the output. Without `--run` it is a dry run. There is no question when it runs, because everything stays inside one container and the lab network.
 - Line 13: `set -euo pipefail`.
 - Lines 15 to 18: constants. `CONTAINER` is the proxy container's name (the project name, the service and `-1`). The two URLs are fixed.
-- Line 20: `[[ $# -ge 2 ]] || { ...; exit 2; }`: at least the runs and the output file. Lines 21 and 22 store them. Lines 23 to 25: the same runs check (1 to 50) and refusal to overwrite as in `curl-timings.sh`.
-- Line 26: `format='...'`. A single-quoted string, so the shell leaves `%` and `\` alone. It has the same fields as `curl-timings.sh`, except there is no `encoding` or `cache` header. `%s` is filled later by `printf` with the target name.
+- Line 20: `[[ $# -ge 2 ]] || { ...; exit 2; }`: at least the runs and the output file. Lines 21 and 22 store them. Lines 24 to 26: the same runs check (1 to 50) and refusal to overwrite as in `curl-timings.sh`.
+- Line 27: `format='...'`. A single-quoted string, so the shell leaves `%` and `\` alone. It has the same fields as `curl-timings.sh`, except there is no `encoding` or `cache` header. `%s` is filled later by `printf` with the target name.
 
 ```bash
 echo "plan: inside $CONTAINER, $runs run(s) x 2 targets x 2 requests (new, then reused)"
@@ -629,16 +643,16 @@ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) hop-timings: $written lines to $out_file" >
 echo "wrote $written lines to $out_file"
 ```
 
-- Lines 28 to 30: print the plan.
-- Lines 31 to 34: the dry run. `"${3:-}" != "--run"` looks at the third argument, if any; the script goes on only when it is exactly `--run`.
-- Lines 35 and 36: **check before**. `docker inspect --format '{{.State.Running}}' "$CONTAINER" 2> /dev/null | grep -qx true` is true only when Docker says the container is running (`grep -qx true` matches the whole line `true`). Otherwise the script says to run `stack.sh up` first and exits 1.
-- Line 38: create the folder.
-- Lines 39 to 47: the loop. `for name in hop-direct hop-proxy` picks the label. Lines 40 and 41 choose the URL (`url="$DIRECT_URL"`, then change to the proxy's if `name` is `hop-proxy`). Lines 42 to 46: for each run, `docker exec "$CONTAINER" curl -sS --max-time 10 -o /dev/null -w "$(printf "$format" "$name")" "$url" -o /dev/null "$url" >> "$out_file"`. `docker exec` runs a command inside the container. `$(printf "$format" "$name")` fills the name into the format. Giving the URL twice makes curl fetch it twice on one connection: the first request is on a **new** connection, the second **reused**. Line 43 is a comment for the linter ShellCheck: the format string comes from a variable on purpose.
-- Lines 48 to 51: **check after**. Count lines; append an audit line; `(( written == runs * 4 ))` checks the count (2 targets times 2 requests per run); otherwise print both numbers and exit 1.
+- Lines 29 to 31: print the plan.
+- Lines 32 to 35: the dry run. `"${3:-}" != "--run"` looks at the third argument, if any; the script goes on only when it is exactly `--run`.
+- Lines 36 and 37: **check before**. `docker inspect --format '{{.State.Running}}' "$CONTAINER" 2> /dev/null | grep -qx true` is true only when Docker says the container is running (`grep -qx true` matches the whole line `true`). Otherwise the script says to run `stack.sh up` first and exits 1.
+- Line 39: create the folder.
+- Lines 40 to 48: the loop. `for name in hop-direct hop-proxy` picks the label. Lines 41 and 42 choose the URL (`url="$DIRECT_URL"`, then change to the proxy's if `name` is `hop-proxy`). Lines 43 to 47: for each run, `docker exec "$CONTAINER" curl -sS --max-time 10 -o /dev/null -w "$(printf "$format" "$name")" "$url" -o /dev/null "$url" >> "$out_file"`. `docker exec` runs a command inside the container. `$(printf "$format" "$name")` fills the name into the format. Giving the URL twice makes curl fetch it twice on one connection: the first request is on a **new** connection, the second **reused**. Line 44 is a comment for the linter ShellCheck: the format string comes from a variable on purpose.
+- Lines 49 to 52: **check after**. Count lines; append an audit line; `(( written == runs * 4 ))` checks the count (2 targets times 2 requests per run); otherwise print both numbers and exit 1.
 
 ## Try it yourself
 
-I ran these on 11 November 2026 in a **copy** of the repository. The copy differed from the original in three lines: `PROJECT` in `stack.sh` and `spof.sh` and `CONTAINER` in `hop-timings.sh` named `seatwave-proxy-notes` instead of `seatwave-proxy`, so my run could not touch any other project. So the output below says `seatwave-proxy-notes` where yours says `seatwave-proxy`. Timings and times differ on every run. Every command here is safe: the first four only print.
+I ran these on 11 November 2026 in **copies** of the repository. Commands 1 to 3 and 7 ran on version 1.0.1, with a stand-in for `docker` first on the `PATH` (a three-line script that answers every command with success and prints nothing), so the scripts' Docker check passes without a Docker engine and nothing is started. Commands 4 to 6 ran on version 1.0.0 against a real stack, in a copy whose `PROJECT` in `stack.sh` and `spof.sh` and `CONTAINER` in `hop-timings.sh` named `seatwave-proxy-notes` instead of `seatwave-proxy`, so that run could not touch any other project; their output says `seatwave-proxy-notes` where yours says `seatwave-proxy`. Timings and times differ on every run. Every command here is safe: commands 1 to 3 and 7 only print.
 
 1. The dry run of `stack.sh` and a refusal:
 
@@ -650,8 +664,8 @@ scripts/stack.sh jump; echo "exit $?"
 Output:
 
 ```
-plan: up the Compose project seatwave-proxy-notes
-  ./gradlew -q stackPrepare; docker compose -p seatwave-proxy-notes up -d --build; wait for https://127.0.0.1:20900/health
+plan: up the Compose project seatwave-proxy
+  ./gradlew -q stackPrepare; docker compose -p seatwave-proxy up -d --build --quiet-pull; wait for https://127.0.0.1:20900/health
 dry run: nothing changed. Add --run to do it.
 usage: scripts/stack.sh <up|down|test|status> [--run] [--yes]
 exit 2
@@ -752,9 +766,39 @@ probe: GET https://127.0.0.1:20900/health every 100 ms for 30 s, one client, HTT
 outage: none that ended inside the probe
 ```
 
+Version 1.0.1's probe ends the same run with `outage: none, every request succeeded` (`java-probe-walkthrough.md`).
+
 I also ran `scripts/spof.sh proxy --run --yes` and `scripts/spof.sh backend --run --yes`. They stopped the container for 10 s and the probe saw an outage of 10.409 s and 11.013 s. `reverse-proxy-concepts.md` has the table. Afterwards `cat build/stack/audit.log` listed every stop, start and reload with the time.
 
 Finally, stop what you started: `scripts/stack.sh down --run --yes`. It ends with `stack is down: no container, network or volume of seatwave-proxy is left`.
+
+7. The three input mistakes of version 1.0.0, on version 1.0.1. A targets file whose last line has no line break, a run count with a leading zero, and a `spof.sh` dry run with the stack down:
+
+```
+printf 'a http://127.0.0.1:20911/health\nb http://127.0.0.1:20902/health' > build/try/nonewline.txt
+scripts/curl-timings.sh build/try/nonewline.txt 1 build/try/n.out | head -3
+scripts/curl-timings.sh build/try/nonewline.txt 010 build/try/n.out; echo "exit $?"
+scripts/curl-timings.sh build/try/nonewline.txt 08 build/try/n.out; echo "exit $?"
+scripts/spof.sh reload; echo "exit $?"
+```
+
+Output:
+
+```
+plan: 1 run(s) x 2 target(s) x 1 request(s) = 2 requests
+  a  http://127.0.0.1:20911/health
+  b  http://127.0.0.1:20902/health
+runs must be 1 to 50
+exit 2
+runs must be 1 to 50
+exit 2
+plan: probe https://127.0.0.1:20900/health for 30 s; nginx -t and nginx -s reload at 5 s and again 5 s later
+note: the proxy of seatwave-proxy is not running now; start it with scripts/stack.sh up --run
+dry run: nothing changed. Add --run to do it.
+exit 0
+```
+
+Both targets are read, the leading zeros are refused with the script's own message, and the dry run says what it saw and exits 0. Version 1.0.0 listed only target `a`, ran `010` as 8 runs, printed `value too great for base` for `08`, and ended the dry run with exit status 1.
 
 ## Mistakes people make
 
@@ -763,8 +807,9 @@ Finally, stop what you started: `scripts/stack.sh down --run --yes`. It ends wit
 - **Running a script that changes things by default.** All four scripts do nothing unless given `--run` (and three ask first).
 - **Parsing `ls` or `docker ps` output with spaces.** The scripts use `-q` and `--filter` options that give clean, one-per-line output.
 - **Leaving the stack up after a failed test.** `stack.sh test` uses `trap ... EXIT`, so `down` runs on every path.
-- **Reading a number with a leading zero.** In Bash arithmetic `010` is octal, 8. `curl-timings.sh` accepts the text `010` as a run count (its plan then says `010 run(s)` but sends 8 runs of requests), and the text `08` makes `(( ... ))` print `value too great for base`. Type plain numbers. (This is a defect in line 52 of the script; see my report.)
-- **A targets file without a newline at the end of the last line.** `read` returns failure for a last line with no newline, so `curl-timings.sh` silently ignores that line. I tested it with a two-line file: the plan listed one target. End every targets file with a newline.
+- **Reading a number with a leading zero.** In Bash arithmetic `010` is octal, 8, and `08` is an error (`value too great for base`). Check the text with a pattern that refuses a leading zero before any `(( ... ))`, as `curl-timings.sh` and `hop-timings.sh` now do (command 7).
+- **A file without a newline at the end of the last line.** `read` returns failure for a last line with no newline, so a plain `while read` loop silently drops that line. Add `|| [[ -n "$var" ]]` to the loop's condition, as `curl-timings.sh` now does (command 7).
+- **A health check that accepts any answer.** `curl` succeeds on a `502` unless it is given `--fail`. A wait-until-up loop must ask for a success status, as `stack.sh` does.
 - **Hard-coded names.** `hop-timings.sh` names the container `seatwave-proxy-proxy-1`. If you start the project under another name, the script cannot find it.
 
 ## Check yourself

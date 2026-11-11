@@ -44,7 +44,9 @@ Each scenario then gets 3 measured runs (`run.repeats=3`). Each run becomes one 
 
 **Wire bytes and plain bytes.** **Wire bytes** are the body bytes as they crossed the network. When the proxy compresses a response with gzip, the wire bytes are fewer than the **plain bytes**, which are the bytes after the client decompresses. The row shows both per response.
 
-**What each side cost.** The bench asks each container how much processor time it has used and how many TCP connections it has accepted and opened, once before and once after each run (this is part 2). The difference is the cost of the run. Processor time is divided by the number of requests to give **CPU milliseconds per thousand requests** (`CPU ms/1k`): the lower, the cheaper.
+**What each side cost.** The bench asks each container how much processor time it has used and how many TCP connections it has accepted and opened, once before and once after each run (this is part 2). The difference is the cost of the run. Processor time is divided by the number of requests sent, failed ones included, to give **CPU milliseconds per thousand requests** (`CPU ms/1k`): the lower, the cheaper.
+
+**A row that is not a steady rate is flagged.** When more than 1 percent of the median run's requests failed, or the three runs are far apart (the fastest more than twice the slowest), the table prints a warning line under the row. Its median is still a real run, but it does not describe a steady rate, and the reader is told so.
 
 **Settings are data, not code.** The scenarios are listed in `config/bench.properties`, a **properties file**: lines of `key=value` (see `java-properties.md`). `BenchSettings` reads the file through `SettingsReader`, a helper class of the `config` package that reads typed values and collects one problem sentence per bad key, so that you see every mistake at once. There are no defaults: a missing key is a problem, never a silent fallback.
 
@@ -114,11 +116,14 @@ public record Scenario(String name, URI uri, boolean acceptsGzip, ConnectionMode
 - `public record Scenario(String name, URI uri, boolean acceptsGzip, ConnectionMode mode)` declares a record with four components. After it is built, `scenario.name()`, `scenario.uri()`, `scenario.acceptsGzip()` and `scenario.mode()` return them, and a record never changes after construction.
 
 ```java
-  /** A scenario name: lower-case letters, digits and hyphens, at most 24 characters. */
-  public static final Pattern NAME = Pattern.compile("[a-z][a-z0-9-]{0,23}");
+  /**
+   * A scenario name: lower-case letters, digits and hyphens, at most 17 characters, the width of
+   * the bench table's first column.
+   */
+  public static final Pattern NAME = Pattern.compile("[a-z][a-z0-9-]{0,16}");
 ```
 
-- `NAME` is a **regular expression**: `[a-z]` is one lower-case letter, then `[a-z0-9-]{0,23}` is from 0 to 23 lower-case letters, digits or hyphens. The first character must therefore be a letter, and the whole name is at most 24 characters. Names such as `direct-tls` and `page-production` pass; `Bad Name` does not (capital letter and space).
+- `NAME` is a **regular expression**: `[a-z]` is one lower-case letter, then `[a-z0-9-]{0,16}` is from 0 to 16 lower-case letters, digits or hyphens. The first character must therefore be a letter, and the whole name is at most 17 characters, the width of the first column of the bench table (`BenchReport.ROW`, below), so a name can never push its row out of line. (The first version allowed 24 characters for a 17-character column.) Names such as `direct-tls` and `page-production` pass; `Bad Name` does not (capital letter and space).
 - `public static final` makes it a constant that `BenchSettings` reuses.
 
 ```java
@@ -189,6 +194,8 @@ public record Counters(long cpuMicros, long passiveOpens, long activeOpens) {
    *
    * @param earlier the reading before the run
    * @return the growth, which is what one run cost
+   * @throws IllegalArgumentException if a counter went down, which happens when the container
+   *     started again between the two readings
    */
   public Counters since(Counters earlier) {
     return new Counters(
@@ -201,7 +208,7 @@ public record Counters(long cpuMicros, long passiveOpens, long activeOpens) {
 
 - `since(earlier)` returns how much each counter grew since an earlier reading. The bench reads the counters before a run and after it, and `after.since(before)` is what the run cost.
 - `Math.subtractExact(a, b)` subtracts and throws `ArithmeticException` if the result does not fit in a `long`. It cannot silently wrap around.
-- The new `Counters` goes through the checking constructor, so if the container was restarted between the two readings (its counters begin again at zero), the difference is negative and the constructor throws `IllegalArgumentException("a counter cannot be negative")`. That is the only protection against a mid-run restart.
+- The new `Counters` goes through the checking constructor, so if the container was restarted between the two readings (its counters begin again at zero), the difference is negative and the constructor throws `IllegalArgumentException("a counter cannot be negative")`. The Javadoc's `@throws` line says so. `BenchCli` catches that exception and stops the bench with a clear message and exit status 1 (part 2), instead of the stack trace the first version printed.
 
 ### `bench/LoadResult.java`
 
@@ -325,9 +332,9 @@ public record BenchRow(Scenario scenario, LoadResult result, Counters proxy, Cou
 
 ```java
   /**
-   * Returns the proxy's CPU time per thousand successful requests.
+   * Returns the proxy's CPU time per thousand requests sent.
    *
-   * @return milliseconds of CPU, or 0 when nothing succeeded
+   * @return milliseconds of CPU, or 0 when nothing was sent
    */
   public double proxyCpuMillisPerThousand() {
     return perThousand(proxy.cpuMicros() / MICROS_PER_MILLI);
@@ -338,9 +345,9 @@ public record BenchRow(Scenario scenario, LoadResult result, Counters proxy, Cou
 
 ```java
   /**
-   * Returns SeatWave's CPU time per thousand successful requests.
+   * Returns SeatWave's CPU time per thousand requests sent.
    *
-   * @return milliseconds of CPU, or 0 when nothing succeeded
+   * @return milliseconds of CPU, or 0 when nothing was sent
    */
   public double backendCpuMillisPerThousand() {
     return perThousand(backend.cpuMicros() / MICROS_PER_MILLI);
@@ -349,28 +356,20 @@ public record BenchRow(Scenario scenario, LoadResult result, Counters proxy, Cou
 
 - The same for SeatWave.
 
-```java
-  /**
-   * Returns the connections SeatWave accepted per thousand successful requests.
-   *
-   * @return connections, or 0 when nothing succeeded
-   */
-  public double backendConnectionsPerThousand() {
-    return perThousand(backend.passiveOpens());
-  }
-```
-
-- `backendConnectionsPerThousand()` scales the number of connections SeatWave accepted. The report does not call it: `BenchReport` prints the raw `backend().passiveOpens()` count instead. The method is unused code in this repository.
+The report prints the connection counts as they are (`backend().passiveOpens()`), not per thousand, so the record has no method for that. (The first version had one, `backendConnectionsPerThousand()`, that nothing called.)
 
 ```java
   private double perThousand(double amount) {
-    return result.requests() == 0 ? 0 : amount * PER_THOUSAND / result.requests();
+    // Every request sent, successful or not: a container spends CPU on a failed request too, so
+    // dividing by the successes alone would charge the failures' CPU to them.
+    long sent = Math.addExact(result.requests(), result.errors());
+    return sent == 0 ? 0 : amount * PER_THOUSAND / sent;
   }
 }
 ```
 
-- `perThousand(amount)` is `amount * 1000 / requests`. It divides by the **successful** requests only (`result.requests()`), but the processor time covers every request the container handled, failed ones included. When a scenario has many errors, the "per thousand" figure is therefore larger than the true cost of a good request. The README's `proxy-no-reuse` row shows it: 2,991 successful requests, 3,330 errors, and 3328.0 CPU ms per thousand.
-- With zero successful requests the method returns 0, not a division error.
+- `perThousand(amount)` is `amount * 1000 / sent`, where `sent` is every request of the run, successful or failed: `Math.addExact` adds the two counts and throws instead of wrapping around if the sum did not fit in a `long`. The comment gives the reason: the processor time covers every request the container handled, failed ones included. The first version divided by the successful requests only, so a run with many errors looked more expensive per request than it was. The README's first `proxy-no-reuse` row, measured with that version, shows it: 2,991 successful requests, 3,330 errors, and 3328.0 CPU ms per thousand.
+- With no request sent the method returns 0, not a division error.
 
 ### `bench/BenchSettings.java`
 
@@ -430,7 +429,6 @@ public record BenchSettings(
   // ports, and nothing else, so a typo cannot send load to another host.
   private static final Pattern LAB_URI =
       Pattern.compile("https?://127\\.0\\.0\\.1:209[0-9]{2}/[A-Za-z0-9/._?=&-]*");
-  private static final Pattern FILE = Pattern.compile("[A-Za-z0-9_./-]{1,200}");
   private static final Pattern YES_NO = Pattern.compile("yes|no");
   private static final Pattern MODE = Pattern.compile("reuse|new");
   private static final int MAX_TIMEOUT_MILLIS = 60_000;
@@ -440,7 +438,6 @@ public record BenchSettings(
 ```
 
 - `LAB_URI` is the allow-list for scenario addresses: `https?` means `http` or `https` (the `?` makes the `s` optional), then `://127\.0\.0\.1:`, which is exactly this machine's loopback address (the dots are escaped with `\` because a bare `.` means "any character"), then `209[0-9]{2}`, which is port 20900 to 20999, then `/` and a path of letters, digits and `/ . _ ? = & -`. Any other host, such as `example.com`, fails the match. A typo therefore cannot send load to another computer. The two lines of comment above it say so.
-- `FILE` allows a relative or absolute path of up to 200 characters made of letters, digits, `_`, `.`, `/` and `-`. It has no room for spaces. A path longer than 200 characters is refused as well, which matters when the repository is checked out deep inside a long folder name: the test `BenchCliTest` builds an absolute path to the test certificates and fails with a settings problem if that path is longer than 200 characters.
 - `YES_NO` and `MODE` list the only words allowed for the `gzip` and `connection` keys of a scenario.
 - The `MAX_...` numbers are upper bounds that stop a typo from asking for a one-hour run or a million clients: 60 seconds for a timeout, 10 minutes for a run, 50 repeats, 2,000 clients.
 
@@ -477,7 +474,7 @@ public record BenchSettings(
    */
   public static Result<BenchSettings, List<String>> from(SettingsReader reader) {
     Objects.requireNonNull(reader, "reader");
-    String authority = reader.textMatching("tls.authorityPem", FILE);
+    String authority = reader.filePath("tls.authorityPem");
     Duration connect = reader.millisBetween("client.connectTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration request = reader.millisBetween("client.requestTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration warmup = reader.millisBetween("run.warmupMillis", 0, MAX_RUN_MILLIS);
@@ -554,7 +551,9 @@ import java.util.stream.Collectors;
 
 /**
  * Writes the bench table: one row per scenario, the median of its runs by requests per second, with
- * every run's throughput listed so the spread stays visible. Thread-safe: it holds no state.
+ * every run's throughput listed so the spread stays visible. A row whose run had many failures, or
+ * whose runs differ widely, gets a warning line under it, because its median is not a steady rate.
+ * Thread-safe: it holds no state.
  */
 public final class BenchReport {
 ```
@@ -574,6 +573,10 @@ public final class BenchReport {
   private static final double NANOS_PER_MILLI = 1_000_000.0;
   private static final double NANOS_PER_SECOND = 1_000_000_000.0;
   private static final double PERCENT = 100.0;
+  // More than 1 percent of failed requests, or a fastest run more than twice the slowest, and the
+  // row is not a steady measurement: it is shown, with a warning, never quietly as a median.
+  private static final double ERROR_SHARE_LIMIT = 0.01;
+  private static final double SPREAD_LIMIT = 2.0;
 ```
 
 - `HEADER` is the table's first line. The two string pieces are joined with `+` because one line would be too long. The column titles are padded with spaces so that they sit above the numbers.
@@ -585,8 +588,9 @@ public final class BenchReport {
   - `%16.1f` and `%19.1f` are the two CPU columns with one digit after the point.
   - `%15d`, `%13d`, `%18d` are the three connection counts.
   - `%n` is a line break for the current system.
-- A scenario name longer than 17 characters would push its row out of line. The allowed names go up to 24 characters, and the names in `config/bench.properties` are at most 16.
+- A scenario name longer than 17 characters would push its row out of line, so `Scenario.NAME` allows at most 17. The names in `config/bench.properties` are at most 16.
 - `PERCENT = 100.0` and the two `NANOS_PER_...` constants name the numbers used for unit conversion.
+- `ERROR_SHARE_LIMIT = 0.01` and `SPREAD_LIMIT = 2.0` are the two thresholds of the warning lines (below): more than 1 percent of the median run's requests failed, or the fastest run was more than twice the slowest. The comment says what they are for: such a row is still shown, with a warning, never quietly as a median.
 
 ```java
   private BenchReport() {}
@@ -662,13 +666,43 @@ public final class BenchReport {
                     each.result().requests(),
                     each.result().elapsed().toNanos() / NANOS_PER_SECOND))
             .collect(Collectors.joining(", ", "  runs (rps): ", System.lineSeparator()));
-    return line + spread;
+    return line + spread + warnings(runs, result);
+  }
+
+  private static String warnings(List<BenchRow> runs, LoadResult median) {
+    StringBuilder text = new StringBuilder();
+    long sent = median.requests() + median.errors();
+    double errorShare = sent == 0 ? 0 : (double) median.errors() / sent;
+    if (errorShare > ERROR_SHARE_LIMIT) {
+      text.append(
+          String.format(
+              Locale.ROOT,
+              "  warning: %.0f percent of the requests of this run failed; the other columns describe"
+                  + " a failing path%n",
+              PERCENT * errorShare));
+    }
+    double slowest =
+        runs.stream().mapToDouble(each -> each.result().requestsPerSecond()).min().orElse(0);
+    double fastest =
+        runs.stream().mapToDouble(each -> each.result().requestsPerSecond()).max().orElse(0);
+    if (fastest > slowest * SPREAD_LIMIT) {
+      text.append(
+          String.format(
+              Locale.ROOT,
+              "  warning: the runs differ by more than %.0f times (%.0f to %.0f rps), so the median"
+                  + " is not a steady rate%n",
+              SPREAD_LIMIT,
+              slowest,
+              fastest));
+    }
+    return text.toString();
   }
 ```
 
 - `runs.stream()` turns the list into a **stream**, a pipeline of steps. `.map(each -> String.format(...))` turns each run into a piece of text like `4555 (45550 in 10.0 s)`: its throughput, how many requests, and how long it really lasted.
 - `.collect(Collectors.joining(", ", "  runs (rps): ", System.lineSeparator()))` joins the pieces with `, `, puts `  runs (rps): ` in front and a line break at the end.
-- The method returns the row line followed by the runs line.
+- The method returns the row line, the runs line and any warning lines.
+- `warnings(runs, median)` builds those lines. `sent` is the median run's successful and failed requests together, and `errorShare` the failed part of it, from 0 to 1; `(double)` turns the whole number into a decimal before the division, so `1 / 4` is 0.25 and not 0. Above `ERROR_SHARE_LIMIT` the first warning prints the share as a percentage. Then `mapToDouble(...).min()` and `.max()` find the slowest and the fastest run's throughput (`orElse(0)` covers an empty list, which `median` has already refused). If the fastest is more than `SPREAD_LIMIT` times the slowest, the second warning prints both. For the runs 957, 299 and 4 requests per second, it prints `  warning: the runs differ by more than 2 times (4 to 957 rps), so the median is not a steady rate` (`BenchReportTest.warnsWhenTheRunsDifferByMoreThanTwoTimes` checks exactly that text).
 
 ```java
   private static double millis(Duration duration) {
@@ -732,7 +766,7 @@ All four mistakes came back in one answer, and no load was possible.
 ./gradlew test --tests '*BenchReportTest' --tests '*BenchSettingsTest'
 ```
 
-Gradle prints `BUILD SUCCESSFUL`. `BenchReportTest` builds three runs of 1,000, 3,000 and 2,000 requests and checks that the median is the 2,000 one.
+Gradle prints `BUILD SUCCESSFUL`. `BenchReportTest` builds three runs of 1,000, 3,000 and 2,000 requests and checks that the median is the 2,000 one; two more tests check the CPU arithmetic of a failing row and both warning lines (`tests-tools-walkthrough-1.md`).
 
 **3. Check a figure from the README by hand.** The README's `gzip-9` row says 601.7 proxy CPU milliseconds per thousand requests. Divide by 1,000: about 0.6 ms of proxy processor time for each request. The `gzip-1` row says 99.5, about 0.1 ms per request. The difference is the extra effort of compression level 9.
 
@@ -742,7 +776,7 @@ The full bench needs the Docker stack, which these notes did not run (see `measu
 
 - **Reporting one run.** A single run can be an outlier. The settings refuse fewer than 3 repeats, and `BenchReport.median` refuses fewer than 3 rows.
 - **Averaging instead of taking the median.** One slow run drags a mean. The median is one real run.
-- **Dividing by the wrong count.** `BenchRow` divides processor time by successful requests. In a run with many errors the figure is inflated. Read the `errors` column before you trust a CPU-per-thousand figure.
+- **Dividing by the wrong count.** Processor time covers failed requests too, so `BenchRow` divides it by every request sent. Dividing by the successes alone inflates the figure for a failing run, as the first version did. Still read the `errors` column, and any warning line, before you trust a CPU-per-thousand figure.
 - **Forgetting the warm-up.** The first seconds of a Java program are slow. `run.warmupMillis=5000` throws them away. The TryLoad program in part 2 shows it: its first run is clearly slower than the next ones.
 - **Letting a typo send load elsewhere.** `LAB_URI` allows only `127.0.0.1` on ports 20900 to 20999.
 - **Locale surprises.** Without `Locale.ROOT`, a computer set to German would print `4555,0` with a comma. Every `String.format` here passes `Locale.ROOT`.

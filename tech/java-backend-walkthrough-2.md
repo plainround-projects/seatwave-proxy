@@ -146,13 +146,7 @@ The fields: `requests` maps the text `route|status` to its counter; `busyWorkers
 
 Three tiny methods count a forwarding header that was ignored, one that was unreadable, and a request refused by the queue.
 
-```java
-  int busyWorkers() {
-    return busyWorkers.get();
-  }
-```
-
-`busyWorkers()` returns the current number. Nothing in the repository calls it (the tests read the number from the `/metrics` text instead), so it is unused code.
+There is no method that returns the number of busy workers to Java code: the tests and the slow-client tool read it from the `/metrics` text. (The first version had such a method, `busyWorkers()`, that nothing called; it was removed.)
 
 ```java
   String render() {
@@ -165,14 +159,14 @@ Three tiny methods count a forwarding header that was ignored, one that was unre
       text.append(
           String.format(
               Locale.ROOT,
-              "seatwave_requests_total{route=\"%s\",status=\"%s\"} %d%n",
+              "seatwave_requests_total{route=\"%s\",status=\"%s\"} %d\n",
               key.substring(0, bar),
               key.substring(bar + 1),
               count));
     });
 ```
 
-`render` writes the text. The first line, `# TYPE seatwave_requests_total counter`, tells a reader the kind of metric. The counters are copied into a `TreeMap` so the lines come out sorted, which keeps the output stable. For each entry, `key.lastIndexOf('|')` finds the separator (the route text can contain spaces and braces but never a bar), and `String.format` writes `seatwave_requests_total{route="...",status="..."} 3`. `Locale.ROOT` makes the number formatting the same on every computer. `%s` is a text slot, `%d` a whole number, `%n` a line break.
+`render` writes the text. The first line, `# TYPE seatwave_requests_total counter`, tells a reader the kind of metric. The counters are copied into a `TreeMap` so the lines come out sorted, which keeps the output stable. For each entry, `key.lastIndexOf('|')` finds the separator (the route text can contain spaces and braces but never a bar), and `String.format` writes `seatwave_requests_total{route="...",status="..."} 3`. `Locale.ROOT` makes the number formatting the same on every computer. `%s` is a text slot, `%d` a whole number, and `\n` a line feed, the line break the Prometheus text format expects.
 
 ```java
     line(text, "gauge", "seatwave_workers", workerThreads);
@@ -182,7 +176,7 @@ Three tiny methods count a forwarding header that was ignored, one that was unre
         .append(
             String.format(
                 Locale.ROOT,
-                "seatwave_worker_busy_seconds_total %.6f%n",
+                "seatwave_worker_busy_seconds_total %.6f\n",
                 busyNanos.sum() / NANOS_PER_SECOND));
     line(text, "counter", "seatwave_response_bytes_total", responseBytes.sum());
 ```
@@ -212,7 +206,7 @@ Four more counters (bytes, headers ignored, headers unreadable, queue refusals),
 }
 ```
 
-`line` writes one metric: a `# TYPE` line and then `name value`. A small oddity: `render` uses `%n` for the request lines and the busy-seconds line, which is the platform's line separator (a single `\n` on macOS and Linux, `\r\n` on Windows), but `line` always writes `\n`. On Windows the output would mix the two. Nothing in the lab runs the server on Windows, and this was not run there.
+`line` writes one metric: a `# TYPE` line and then `name value`. Every line of the output ends in `\n`, in `line` and in the two `String.format` calls of `render` alike. The first version wrote `%n` in those two formats, which is the platform's line separator (`\r\n` on Windows), so on Windows the output would have mixed two kinds of line end.
 
 ### `backend/BackendCli.java`
 
@@ -410,6 +404,8 @@ public final class BackendServer implements AutoCloseable {
   private static final long SHUTDOWN_WAIT_SECONDS = 5;
   // sendResponseHeaders takes 0 for "length unknown", which makes the JDK server send chunks.
   private static final long CHUNKED = 0;
+  // ... and -1 for "no body at all", the answer to a HEAD request.
+  private static final long NO_BODY = -1;
   private static final int STREAM_OK = 200;
   private static final int ADMIN_OK = 200;
   private static final int ADMIN_NOT_FOUND = 404;
@@ -419,7 +415,7 @@ public final class BackendServer implements AutoCloseable {
   private static final byte[] HEARTBEAT = ": heartbeat\n\n".getBytes(StandardCharsets.UTF_8);
 ```
 
-`BackendServer implements AutoCloseable`, so it can be used in a try-with-resources block and closed automatically. `LOG` is the logger of this class. The constants: `STOP_DELAY_SECONDS = 0` makes a listener stop at once (a lab server has no request worth waiting for). `CHUNKED = 0` is the value the JDK server reads as "the length is unknown", which makes it send the body in **chunks**, the HTTP way to send a body of unknown length. `REQUEST_ID` matches exactly 32 lowercase hexadecimal characters, which is the form of NGINX's `$request_id`; it is believed only when the peer is a trusted proxy.
+`BackendServer implements AutoCloseable`, so it can be used in a try-with-resources block and closed automatically. `LOG` is the logger of this class. The constants: `STOP_DELAY_SECONDS = 0` makes a listener stop at once (a lab server has no request worth waiting for). `CHUNKED = 0` is the value the JDK server reads as "the length is unknown", which makes it send the body in **chunks**, the HTTP way to send a body of unknown length. `NO_BODY = -1` is the value it reads as "there is no body at all"; it is the answer to a `HEAD` request (below). `REQUEST_ID` matches exactly 32 lowercase hexadecimal characters, which is the form of NGINX's `$request_id`; it is believed only when the peer is a trusted proxy.
 
 `HEARTBEAT` is the text `: heartbeat` and two line breaks. In the event-stream format a line that starts with a colon is a **comment**: the browser ignores it, but the bytes cross every idle timer on the path.
 
@@ -442,10 +438,11 @@ The fields: three listeners, the thread that serves the admin listener, the work
     this.settings = settings;
     this.metrics = new BackendMetrics(settings.workerThreads());
     this.routes =
-        new SeatWaveRoutes(new HoldLedger(clock), metrics, settings.timing(), new JsonCodec());
+        new SeatWaveRoutes(
+            new HoldLedger(clock), new HoldKeys(), settings.timing(), new JsonCodec());
 ```
 
-The constructor is private; `start` (below) is the public way in. It stores the settings, makes the metrics (with the pool size), and makes the routes with a new `HoldLedger`, the metrics, the timing and a new `JsonCodec`. The `throws IOException` says it can fail while binding ports.
+The constructor is private; `start` (below) is the public way in. It stores the settings, makes the metrics (with the pool size), and makes the routes with a new `HoldLedger`, a new `HoldKeys` (the Idempotency-Key table), the timing and a new `JsonCodec`. The routes get the key table from outside so a test can hand them one it already filled (`SeatWaveRoutesTest`); the first version made the table inside the routes and passed them the metrics, which they never used. The `throws IOException` says it can fail while binding ports.
 
 ```java
     AtomicInteger workerNumber = new AtomicInteger();
@@ -562,7 +559,10 @@ The admin listener gets an executor with exactly one thread, named `seatwave-adm
 Three getters for the real ports (useful when a port of 0 was asked for).
 
 ```java
-  /** Stops the listeners and the workers, waiting a few seconds for running requests. */
+  /**
+   * Stops the listeners, interrupts the requests that are still running (a long poll or an event
+   * stream ends at once) and waits up to 5 seconds for the workers to finish.
+   */
   @Override
   public void close() {
     plain.stop(STOP_DELAY_SECONDS);
@@ -580,7 +580,7 @@ Three getters for the real ports (useful when a port of 0 was asked for).
   }
 ```
 
-`close` stops the three listeners with a delay of 0, shuts down the admin thread and the workers with `shutdownNow()` (which interrupts running tasks), then waits up to five seconds for the workers to end and logs a warning if they have not. `InterruptedException` is thrown if this thread is interrupted while waiting; the code restores the interrupt flag with `Thread.currentThread().interrupt()` so callers can still see it. Note that the Javadoc says it waits "for running requests", but `shutdownNow()` interrupts them first, so a long poll or a stream that is running ends at once instead of finishing. The words are looser than the behavior.
+`close` stops the three listeners with a delay of 0, shuts down the admin thread and the workers with `shutdownNow()` (which interrupts running tasks), then waits up to five seconds for the workers to end and logs a warning if they have not. `InterruptedException` is thrown if this thread is interrupted while waiting; the code restores the interrupt flag with `Thread.currentThread().interrupt()` so callers can still see it. The Javadoc says exactly this: the requests still running are interrupted, so a long poll or a stream ends at once instead of finishing (the long poll then answers 503 "the server is stopping", which `SeatWaveRoutesTest` checks), and only then does `close` wait. The first version's Javadoc said it waited "for running requests", which was looser than the behavior.
 
 ```java
   private void handle(HttpExchange exchange, String scheme) {
@@ -591,19 +591,17 @@ Three getters for the real ports (useful when a port of 0 was asked for).
     long bytes = 0;
     try (exchange) {
       Request request = request(exchange, scheme);
-      MDC.put("correlationId", request.correlationId());
       SeatWaveRoutes.Routed routed = routes.route(request);
       route = routed.route();
 ```
 
-`handle` is the one method every request on the plain and TLS listeners goes through. It records the start time (`System.nanoTime()` is a high-resolution stopwatch, good for measuring durations), counts the worker as busy, and sets default values for the route name, status and byte count so that the `finally` block always has something to report. `try (exchange)` closes the exchange when the block ends, even after an error. `request(exchange, scheme)` copies the request. `MDC.put("correlationId", ...)` makes the id appear on every log line this thread writes from now on.
+`handle` is the one method every request on the plain and TLS listeners goes through. It records the start time (`System.nanoTime()` is a high-resolution stopwatch, good for measuring durations), counts the worker as busy, and sets default values for the route name, status and byte count so that the `finally` block always has something to report. `try (exchange)` closes the exchange when the block ends, even after an error. `request(exchange, scheme)` copies the request and also puts the correlation id into the logging context (below).
 
 ```java
       switch (routed.reply()) {
         case Reply.Body body -> {
           status = body.status();
-          bytes = body.length();
-          writeBody(exchange, body, startNanos);
+          bytes = writeBody(exchange, body, startNanos);
         }
         case Reply.EventStream stream -> {
           status = STREAM_OK;
@@ -612,7 +610,7 @@ Three getters for the real ports (useful when a port of 0 was asked for).
       }
 ```
 
-`routes.route(request)` returns a `Routed` (route template and reply). The `switch` over `routed.reply()` has two cases because `Reply` is sealed: a whole `Body` (record the status and the byte count, then `writeBody`) or an `EventStream` (the status is 200, and `writeStream` returns the bytes it wrote). There is no default; the compiler knows these are all the kinds.
+`routes.route(request)` returns a `Routed` (route template and reply). The `switch` over `routed.reply()` has two cases because `Reply` is sealed: a whole `Body` (record the status, then `writeBody`, which returns the bytes it really wrote: 0 for a `HEAD`) or an `EventStream` (the status is 200, and `writeStream` returns the bytes it wrote). There is no default; the compiler knows these are all the kinds.
 
 ```java
     } catch (IOException clientGone) {
@@ -681,13 +679,9 @@ If the client closed the connection while SeatWave was reading or writing, an `I
       // The forged-header case of the invariant: counted, and the headers are not used.
       metrics.forwardingIgnored();
     }
-    if (client.source() == AddressSource.UNREADABLE) {
-      metrics.forwardingUnreadable();
-      LOG.warn("a trusted proxy sent forwarding headers that cannot be read; using its address");
-    }
 ```
 
-`ClientAddress.resolve(peer, forwarding, trustedProxies, scheme)` decides the client once (see `java-forwarded-walkthrough.md`). Then the invariant's bookkeeping. If the peer is not a trusted proxy and still sent forwarding headers, a forged-header case: `forwardingIgnored()` counts it and the headers are not used. If the result is `UNREADABLE`, a trusted proxy sent headers that could not be read: it is counted and a warning is logged. The warning line is written before the `MDC.put` in `handle`, so it carries no correlation id (`[none]` in the log pattern).
+`ClientAddress.resolve(peer, forwarding, trustedProxies, scheme)` decides the client once (see `java-forwarded-walkthrough.md`). Then the invariant's bookkeeping. If the peer is not a trusted proxy and still sent forwarding headers, a forged-header case: `forwardingIgnored()` counts it and the headers are not used. If the result is `UNREADABLE`, a trusted proxy sent headers that could not be read; that case is handled after the correlation id is known (below).
 
 ```java
     List<String> requestIds = headers.getOrDefault("x-request-id", List.of());
@@ -697,9 +691,15 @@ If the client closed the connection while SeatWave was reading or writing, an `I
                 && REQUEST_ID.matcher(requestIds.getFirst()).matches()
             ? requestIds.getFirst()
             : UUID.randomUUID().toString().replace("-", "");
+    // Set before the first log line of the request, so every line carries the correlation id.
+    MDC.put("correlationId", correlationId);
+    if (client.source() == AddressSource.UNREADABLE) {
+      metrics.forwardingUnreadable();
+      LOG.warn("a trusted proxy sent forwarding headers that cannot be read; using its address");
+    }
 ```
 
-The correlation id: if the peer is a trusted proxy, and it sent exactly one `X-Request-Id`, and the value is 32 hex characters, it is used, so a proxy log line and a SeatWave log line can be matched. Otherwise a random UUID without hyphens is made. A client talking directly cannot choose the id.
+The correlation id: if the peer is a trusted proxy, and it sent exactly one `X-Request-Id`, and the value is 32 hex characters, it is used, so a proxy log line and a SeatWave log line can be matched. Otherwise a random UUID without hyphens is made. A client talking directly cannot choose the id. `MDC.put("correlationId", correlationId)` then puts it into the logging context, which makes it appear on every log line this thread writes until `MDC.clear()` in `handle`. Only after that is an `UNREADABLE` result counted and warned about, so the warning carries the id too. The comment says why the order matters: in the first version the warning came before the `MDC.put` (which sat in `handle`), so it was the one line of the request with no id (`[none]` in the log pattern).
 
 ```java
     byte[] body;
@@ -731,7 +731,7 @@ The body is read with `readNBytes(MAX_BODY_BYTES + 1)`: one byte more than the l
 `getRawQuery()` is `null` when there is no query, so it is replaced with an empty string. The request is built; an oversized body is replaced with an empty array and flagged.
 
 ```java
-  private static void writeBody(HttpExchange exchange, Reply.Body body, long startNanos)
+  private static long writeBody(HttpExchange exchange, Reply.Body body, long startNanos)
       throws IOException {
     exchange.getResponseHeaders().set("Content-Type", body.contentType());
     body.headers()
@@ -741,16 +741,23 @@ The body is read with `readNBytes(MAX_BODY_BYTES + 1)`: one byte more than the l
     exchange
         .getResponseHeaders()
         .set("Server-Timing", String.format(Locale.ROOT, "app;dur=%.2f", serverMillis));
+    if (isHead(exchange)) {
+      // The same headers as the GET, the length the GET would send, and no body.
+      exchange.getResponseHeaders().set("Content-Length", Integer.toString(body.length()));
+      exchange.sendResponseHeaders(body.status(), NO_BODY);
+      return 0;
+    }
     exchange.sendResponseHeaders(body.status(), body.length());
     try (OutputStream out = exchange.getResponseBody()) {
       // This write is what a slow client stretches: it returns only when the kernel has taken
       // every byte, so the worker stays busy until then.
       out.write(body.body());
     }
+    return body.length();
   }
 ```
 
-`writeBody` sets `Content-Type`, adds the reply's own headers, and sets `Server-Timing: app;dur=<milliseconds>`: the time the handler has used so far, so a client can tell server time from network and proxy time. `String.format(Locale.ROOT, "app;dur=%.2f", ...)` writes two decimals. `sendResponseHeaders(status, length)` starts the reply, and `out.write(body.body())` writes the bytes. The comment explains why this matters for the module: `write` returns only when the kernel has taken every byte, so a slow client keeps the worker busy until then.
+`writeBody` sets `Content-Type`, adds the reply's own headers, and sets `Server-Timing: app;dur=<milliseconds>`: the time the handler has used so far, so a client can tell server time from network and proxy time. `String.format(Locale.ROOT, "app;dur=%.2f", ...)` writes two decimals. A **`HEAD` request** asks for exactly the headers a `GET` would get, but no body (RFC 9110, the HTTP standard). A client uses it to learn a file's size or type without downloading it. For `HEAD`, `writeBody` sets `Content-Length` by hand to the length the `GET` would send, calls `sendResponseHeaders(status, NO_BODY)`, where `-1` tells the JDK server that no body follows, and returns 0 bytes written. Otherwise `sendResponseHeaders(status, length)` starts the reply, `out.write(body.body())` writes the bytes, and the method returns their number, which `handle` gives to the metrics. The comment explains why the write matters for the module: `write` returns only when the kernel has taken every byte, so a slow client keeps the worker busy until then. I sent `HEAD /health` to a running SeatWave of version 1.0.1: it answered `200` with `Content-length: 15` and no body. (Version 1.0.0 answered `405`.)
 
 ```java
   private static long writeStream(HttpExchange exchange, Reply.EventStream stream)
@@ -759,6 +766,10 @@ The body is read with `readNBytes(MAX_BODY_BYTES + 1)`: one byte more than the l
     stream
         .headers()
         .forEach(header -> exchange.getResponseHeaders().add(header.getKey(), header.getValue()));
+    if (isHead(exchange)) {
+      exchange.sendResponseHeaders(STREAM_OK, NO_BODY);
+      return 0;
+    }
     exchange.sendResponseHeaders(STREAM_OK, CHUNKED);
     long written = 0;
     long endNanos = System.nanoTime() + stream.lifetime().toNanos();
@@ -782,7 +793,16 @@ The body is read with `readNBytes(MAX_BODY_BYTES + 1)`: one byte more than the l
   }
 ```
 
-`writeStream` writes an event stream. It sets the type `text/event-stream`, adds headers, and sends `200` with the unknown length (`CHUNKED`). It computes when the stream must end (`endNanos`), writes `retry: 1000` and a blank line, and flushes (`flush()` pushes buffered bytes onto the connection now). Then, while at least one heartbeat interval fits before the end, it sleeps one heartbeat (`Thread.sleep(Duration)`), writes the heartbeat and flushes it at once. It returns the number of bytes written. If the thread is interrupted while sleeping (shutdown), the flag is restored and the stream ends.
+`writeStream` writes an event stream. It sets the type `text/event-stream` and adds headers. A `HEAD` gets those headers, `200` and no body (`NO_BODY`), and nothing more. Otherwise it sends `200` with the unknown length (`CHUNKED`). It computes when the stream must end (`endNanos`), writes `retry: 1000` and a blank line, and flushes (`flush()` pushes buffered bytes onto the connection now). Then, while at least one heartbeat interval fits before the end, it sleeps one heartbeat (`Thread.sleep(Duration)`), writes the heartbeat and flushes it at once. It returns the number of bytes written. If the thread is interrupted while sleeping (shutdown), the flag is restored and the stream ends.
+
+```java
+  private static boolean isHead(HttpExchange exchange) {
+    return exchange.getRequestMethod().equals("HEAD");
+  }
+
+```
+
+`isHead` says whether the request's method is `HEAD`. It reads the method from the exchange itself, so `writeBody` and `writeStream` need no extra parameter that switches their behavior.
 
 ```java
   private static HttpsConfigurator tlsOnlyVersion13(SSLContext context) {
@@ -838,8 +858,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Every reply says how it may be cached, because the proxy obeys it: static files are {@code
  * public, max-age=300}; a hold is {@code private}, so no shared cache may keep it; seat maps and
- * events are {@code no-cache}; writes and errors are {@code no-store}. Thread-safe: the ledger, the
- * key table and the metrics are, and nothing else changes after construction.
+ * events are {@code no-cache}; writes and errors are {@code no-store}. Thread-safe: the ledger and
+ * the key table are, and nothing else changes after construction.
  */
 final class SeatWaveRoutes {
 
@@ -895,25 +915,22 @@ Version 0 was deprecated on 11 November 2026 and stops on 11 May 2027. The patte
   private final SeatCatalog catalog;
   private final HoldKeys keys;
   private final StaticFiles staticFiles;
-  private final BackendMetrics metrics;
   private final BackendSettings.Timing timing;
   private final JsonCodec json;
   private final Problems problems;
 
-  SeatWaveRoutes(
-      HoldLedger ledger, BackendMetrics metrics, BackendSettings.Timing timing, JsonCodec json) {
+  SeatWaveRoutes(HoldLedger ledger, HoldKeys keys, BackendSettings.Timing timing, JsonCodec json) {
     this.ledger = Objects.requireNonNull(ledger, "ledger");
-    this.metrics = Objects.requireNonNull(metrics, "metrics");
+    this.keys = Objects.requireNonNull(keys, "keys");
     this.timing = Objects.requireNonNull(timing, "timing");
     this.json = Objects.requireNonNull(json, "json");
     this.catalog = new SeatCatalog(ledger);
-    this.keys = new HoldKeys();
     this.staticFiles = new StaticFiles();
     this.problems = new Problems(json);
   }
 ```
 
-The constructor stores the collaborators and makes the catalog, the key table, the static files and the problem builder. `Objects.requireNonNull` guards each argument.
+The constructor stores the collaborators it is given (the ledger, the key table, the timing, the codec) and makes the catalog, the static files and the problem builder. `Objects.requireNonNull` guards each argument.
 
 ```java
   /**
@@ -924,13 +941,20 @@ The constructor stores the collaborators and makes the catalog, the key table, t
    */
   Routed route(Request request) {
     String path = request.path();
-    if (request.method().equals("POST")) {
-      return path.equals("/v1/holds")
+    String method = request.method();
+    if (path.equals("/v1/holds")) {
+      return method.equals("POST")
           ? new Routed("POST /v1/holds", hold(request))
-          : new Routed("other", notAllowed(request, "GET"));
+          : new Routed("other", notAllowed(request, "POST"));
     }
-    if (!request.method().equals("GET")) {
-      return new Routed("other", notAllowed(request, path.equals("/v1/holds") ? "POST" : "GET"));
+    if (!isReadPath(path)) {
+      // An unknown path is 404 for every method: there is no resource whose methods could be
+      // listed.
+      return new Routed("other", notFound(request));
+    }
+    // HEAD is GET without the body (RFC 9110, Section 9.3.2); the server leaves the body out.
+    if (!method.equals("GET") && !method.equals("HEAD")) {
+      return new Routed("other", notAllowed(request, "GET, HEAD"));
     }
     return switch (path) {
       case "/health" -> new Routed("GET /health", noQuery(request, this::health));
@@ -940,9 +964,26 @@ The constructor stores the collaborators and makes the catalog, the key table, t
       default -> routeByPattern(request);
     };
   }
+
+  private static boolean isReadPath(String path) {
+    return switch (path) {
+      case "/health", "/lab/client", "/v1/events", "/events/1/seats" -> true;
+      default ->
+          path.startsWith("/static/")
+              || EVENT_SEATS.matcher(path).matches()
+              || EVENT_CHANGES.matcher(path).matches()
+              || HOLD_PATH.matcher(path).matches();
+    };
+  }
 ```
 
-`route` is the router. A `POST` is accepted only for `/v1/holds`; any other path with `POST` gets 405 with `Allow: GET`. A method other than `GET` and `POST` gets 405, with `Allow: POST` for `/v1/holds` and `Allow: GET` for every other path. For a `GET`, a `switch` expression on the path picks a route for the four fixed paths; the rest go to `routeByPattern`. Each branch returns a `Routed` pair: the route's template (the metrics label) and the reply. The template, not the real path, is the label, so `/v1/holds/<any uuid>` is always counted as `GET /v1/holds/{holdId}`. Note that a `POST` to an unknown path gets 405 rather than 404, and `HEAD` and `OPTIONS` get 405 too; those are simplifications of this lab.
+`route` is the router, and it follows the meaning RFC 9110 gives the status codes. The path decides first, then the method:
+
+1. `/v1/holds` takes only `POST`. Any other method gets `405 Method Not Allowed` with `Allow: POST`, the header that lists the methods the resource does take.
+2. A path that names no resource at all gets `404 Not Found`, whatever the method, because there is nothing whose methods could be listed. `isReadPath` decides that without running a route: one of the four fixed paths, anything under `/static/`, or a path that fits one of the three patterns. (The first version answered a `POST` to an unknown path with `405` and `Allow: GET`.)
+3. A known path takes `GET` and `HEAD`. Anything else, `PUT` or `OPTIONS` for example, gets 405 with `Allow: GET, HEAD`. `HEAD` runs the same route as `GET`; the server then sends the headers and leaves the body out (`BackendServer.writeBody`).
+
+Then a `switch` expression on the path picks a route for the four fixed paths; the rest go to `routeByPattern`. Each branch returns a `Routed` pair: the route's template (the metrics label) and the reply. The template, not the real path, is the label, so `/v1/holds/<any uuid>` is always counted as `GET /v1/holds/{holdId}`. A `HEAD` is counted under the same template as its `GET`, such as `GET /health`, because it ran the same route.
 
 ```java
   private Routed routeByPattern(Request request) {
@@ -1084,10 +1125,12 @@ The cursor: it must match the allowed characters and decode (see `SeatCatalog.de
           "send at most " + MAX_BODY_BYTES + " bytes",
           request.correlationId());
     }
+    // The media type is the part before any parameter such as "; charset=utf-8", compared without
+    // case (RFC 9110, Section 8.3.1), so "application/jsonx" is not JSON.
     boolean isJson =
         request
             .header("content-type")
-            .map(type -> type.startsWith("application/json"))
+            .map(type -> type.split(";", 2)[0].strip().equalsIgnoreCase("application/json"))
             .orElse(false);
     if (!isJson) {
       return problems.of(
@@ -1099,7 +1142,7 @@ The cursor: it must match the allowed characters and decode (see `SeatCatalog.de
     }
 ```
 
-`hold` handles `POST /v1/holds`. In order: a body over the limit gives 413; a `Content-Type` that does not start with `application/json` gives 415; then the key. `request.header("content-type")` returns nothing if the header was sent twice. Be careful with the test `startsWith("application/json")`: it also accepts `application/jsonx`. A short run on a local copy confirmed that a hold sent with `Content-Type: application/jsonx` is accepted with 201.
+`hold` handles `POST /v1/holds`. In order: a body over the limit gives 413; a `Content-Type` that is not JSON gives 415; then the key. `request.header("content-type")` returns nothing if the header was sent twice. A **media type** such as `application/json` may carry **parameters** after a semicolon (`application/json; charset=utf-8`), and its name is compared without regard to case (RFC 9110). So the code keeps the part before the first `;` (`split(";", 2)[0]`), removes spaces (`strip()`), and compares it with `equalsIgnoreCase`. The first version tested `startsWith("application/json")`, which also accepted `application/jsonx`; now that answers 415, and `Application/JSON; charset=utf-8` is accepted (`BackendServerTest.acceptsOnlyTheJsonMediaTypeWithOrWithoutParameters`).
 
 ```java
     Optional<String> key =
@@ -1154,7 +1197,12 @@ The `Idempotency-Key` header must exist exactly once and match the pattern; othe
               holdSeat(request, parsed);
           case Result.Error<HoldRequestBody, JsonCodec.BindingProblem>(
                   JsonCodec.BindingProblem problem) ->
-              invalid(request, List.of(problem.pointer() + " " + problem.detail()));
+              invalid(
+                  request,
+                  List.of(
+                      problem.pointer().isEmpty()
+                          ? problem.detail()
+                          : problem.pointer() + " " + problem.detail()));
         };
     // Final outcomes are stored, so a retry with the same key gets the same answer (Module 7).
     keys.complete(key, fingerprint, reply);
@@ -1162,7 +1210,7 @@ The `Idempotency-Key` header must exist exactly once and match the pattern; othe
   }
 ```
 
-`holdOnce` binds the body to the `HoldRequestBody` record through the JSON codec. On success `holdSeat` runs; on a binding problem the answer is a 400 whose detail is the JSON pointer of the field and the codec's words. In both cases the reply is stored with `keys.complete(...)`, so a retry gets the same answer. For a whole-body problem the pointer is the empty string, so the detail starts with a space: `" the body is empty; send a JSON object"` (confirmed by a local run).
+`holdOnce` binds the body to the `HoldRequestBody` record through the JSON codec. On success `holdSeat` runs; on a binding problem the answer is a 400 whose detail is the JSON pointer of the field and the codec's words. In both cases the reply is stored with `keys.complete(...)`, so a retry gets the same answer. For a whole-body problem the pointer is the empty string, and the `? :` uses the codec's words alone, such as `the body must be a JSON object`. (The first version always joined pointer, space and detail, so such a detail started with a space.)
 
 ```java
   private Reply.Body holdSeat(Request request, HoldRequestBody body) {
@@ -1193,14 +1241,17 @@ The `Idempotency-Key` header must exist exactly once and match the pattern; othe
     }
     // A business event: logged with the correlation id and the client the invariant allowed.
     LOG.info(
-        "held {} for 300 s; client {}", body.seat(), request.client().address().getHostAddress());
+        "held {} for {} s; client {}",
+        body.seat(),
+        HoldLedger.HOLD_DURATION.toSeconds(),
+        request.client().address().getHostAddress());
     return Reply.json(CREATED, json.write(HoldView.of(hold.get(), ledger.now())))
         .withHeader("Location", "/v1/holds/" + hold.get().holdId())
         .withHeader("Cache-Control", "no-store");
   }
 ```
 
-`holdSeat` validates the fields (all errors together): `eventId` must be 1 or more, `seat` a real label, `customer` 1 to 64 letters, digits, `-` or `_`. The field types are boxed (`Long`, not `long`) on purpose so that a missing field is `null` and reaches this check instead of being turned into 0. Then a 404 for an event other than 1, and the ledger call. If the ledger returns nothing, the seat is held: 409 "seat-unavailable". Otherwise the hold is logged (`LOG.info` with `{}` placeholders that SLF4J fills in) and answered with `201 Created`, a `Location` header and `Cache-Control: no-store`. The log line says "300 s" as fixed text; it does not read `HoldLedger.HOLD_DURATION`.
+`holdSeat` validates the fields (all errors together): `eventId` must be 1 or more, `seat` a real label, `customer` 1 to 64 letters, digits, `-` or `_`. The field types are boxed (`Long`, not `long`) on purpose so that a missing field is `null` and reaches this check instead of being turned into 0. Then a 404 for an event other than 1, and the ledger call. If the ledger returns nothing, the seat is held: 409 "seat-unavailable". Otherwise the hold is logged (`LOG.info` with `{}` placeholders that SLF4J fills in) and answered with `201 Created`, a `Location` header and `Cache-Control: no-store`. The log line reads the length of a hold from `HoldLedger.HOLD_DURATION` (`toSeconds()` gives 300), so the line cannot drift from the real hold; the first version wrote "300 s" as fixed text.
 
 ```java
   private Reply readHold(Request request, String holdId) {
@@ -1423,9 +1474,18 @@ With `forwarded.trustedProxies` changed to an address that is not yours, the sam
 curl -s -X POST http://127.0.0.1:20931/v1/holds -H 'Content-Type: application/json' -H 'Idempotency-Key: "e1"' -d ''
 ```
 
-The `detail` was `" the body is empty; send a JSON object"` (with the leading space). A body `[1]` printed `" the body must be a JSON object"`, `{"eventId":"1",...}` printed `"/eventId has the wrong type"`, and a body with `"eventId"` twice printed `" the body is not valid JSON"`.
+The `detail` was `the body is empty; send a JSON object`. With a new key each time, a body `[1]` printed `the body must be a JSON object`, `{"eventId":"1",...}` printed `/eventId has the wrong type`, a body with `"eventId"` twice printed `/eventId appears more than once`, and an object followed by ` x` printed `the body has data after the JSON object`. (Version 1.0.0 put a space in front of the whole-body details and called the last two `the body is not valid JSON`.) Reuse a key with another body and the answer is `422` with `use a new key for a new request`.
 
-**3. Read the metrics for the routes you just used.**
+**3. Ask with `HEAD`, and with a method a path does not take.**
+
+```
+curl -s -I http://127.0.0.1:20931/health | head -1
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:20931/nothing
+```
+
+`curl -I` sends `HEAD`; it printed `HTTP/1.1 200 OK`. The `POST` to a path that does not exist printed `404`. (Version 1.0.0 printed `405` for both.)
+
+**4. Read the metrics for the routes you just used.**
 
 ```
 curl -s http://127.0.0.1:20932/metrics | grep -v '^#'
@@ -1433,7 +1493,7 @@ curl -s http://127.0.0.1:20932/metrics | grep -v '^#'
 
 It printed one `seatwave_requests_total{route="...",status="..."}` line per route and status, then `seatwave_workers 64`, `seatwave_workers_busy 0`, `seatwave_workers_busy_max 1`, a small `seatwave_worker_busy_seconds_total`, and the three forwarding and queue counters.
 
-**4. Watch a long poll hold a worker.**
+**5. Watch a long poll hold a worker.**
 
 ```
 curl -s 'http://127.0.0.1:20931/v1/events/1/seat-changes?after=1:42'
@@ -1441,7 +1501,7 @@ curl -s 'http://127.0.0.1:20931/v1/events/1/seat-changes?after=1:42'
 
 It waits 25 seconds, then prints `{"items":[],"position":"1:42"}`. The unit test `refusesARequestWhenEveryWorkerIsBusyAndTheQueueIsFull` waits until `/metrics` shows `seatwave_workers_busy 1` while a long poll runs. The 25-second wait itself was not timed here; the unit test of the long poll uses a 200 ms wait.
 
-**5. Run the server tests.**
+**6. Run the server tests.**
 
 ```
 ./gradlew test --tests '*BackendServerTest' --tests '*ForwardedInvariantTest'
@@ -1452,9 +1512,10 @@ They passed. `tests-backend-walkthrough.md` explains them.
 ## Mistakes people make
 
 - **Forgetting that a long poll holds a worker.** 64 long polls fill the pool. The lab uses it on purpose.
-- **Closing the response before the metrics.** In `handle`, `workerFinished` runs after the exchange is closed. A client that sends its next request immediately could read `/metrics` just before the worker has counted the previous request. The window is a few microseconds and the tests do not hit it, but it is a real ordering.
+- **Closing the response before the metrics.** In `handle`, `workerFinished` runs after the exchange is closed. A client that sends its next request immediately could read `/metrics` just before the worker has counted the previous request. The window is a few microseconds, but it is a real ordering, so `BackendServerTest.countsRequestsByRouteAndStatusOnTheOperationsListener` waits for the counts instead of reading them once.
 - **Trusting `X-Request-Id` from anyone.** The server uses it only from a trusted proxy and only in the 32-hex form.
-- **Letting a header-sniffing check be too loose.** `startsWith("application/json")` also accepts `application/jsonx`.
+- **Letting a header-sniffing check be too loose.** `startsWith("application/json")` also accepts `application/jsonx`. Compare the media type itself, without its parameters and without case.
+- **Answering 405 for a path that does not exist.** `405` says "this resource exists, but not for this method" and must list the methods in `Allow`. For a path with no resource, the answer is `404`.
 - **High-cardinality labels.** Metrics labelled by raw path or client address grow without limit. This code labels by route template.
 - **Reading a body without a limit.** `readNBytes(MAX_BODY_BYTES + 1)` bounds the memory a client can make the server use.
 - **Swallowing `InterruptedException`.** Both `longPoll` and `writeStream` restore the interrupt flag, so a stopping server stops.

@@ -67,6 +67,33 @@ class ProbeCliTest {
   }
 
   @Test
+  void namesAnAnswerThatNeverComesAndAConnectionClosedUnderTheRequest() throws Exception {
+    // Closed in reverse order: the server sockets first, which ends the accepting tasks.
+    try (ExecutorService accepting = Executors.newVirtualThreadPerTaskExecutor();
+        ServerSocket silent = new ServerSocket(0, 8, InetAddress.getLoopbackAddress());
+        ServerSocket closing = new ServerSocket(0, 8, InetAddress.getLoopbackAddress())) {
+      accepting.submit(() -> holdOpen(silent));
+      accepting.submit(() -> closeAtOnce(closing));
+      ProbeSettings slowAnswer =
+          new ProbeSettings(
+              URI.create("http://127.0.0.1:" + silent.getLocalPort() + "/health"),
+              TestBackend.TLS.resolve("seatwave-test-ca.pem"),
+              Duration.ofMillis(20),
+              Duration.ofMillis(20),
+              Duration.ofSeconds(1),
+              Duration.ofMillis(200));
+      URI cutOff = URI.create("http://127.0.0.1:" + closing.getLocalPort() + "/health");
+
+      List<Outcome> noAnswer = ProbeCli.probe(TestBackend.client(), slowAnswer);
+      List<Outcome> closed =
+          ProbeCli.probe(TestBackend.client(), settings(cutOff, Duration.ofMillis(20)));
+
+      assertThat(noAnswer).extracting(Outcome::result).containsOnly("request timeout");
+      assertThat(closed).extracting(Outcome::result).containsOnly("connection lost");
+    }
+  }
+
+  @Test
   void printsTheTimelineOfAShortProbeWithItsLengthInMilliseconds() throws Exception {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
     PrintStream printer = new PrintStream(out, true, StandardCharsets.UTF_8);
@@ -122,6 +149,18 @@ class ProbeCliTest {
         client
             .getOutputStream()
             .write("HTTP/1.1 400 Bad Request\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+      } catch (SocketException closed) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  private static Void closeAtOnce(ServerSocket server) throws IOException {
+    // Accepts each connection, reads the request and closes without a word.
+    while (!server.isClosed()) {
+      try (Socket client = server.accept()) {
+        client.getInputStream().read(new byte[1_024]);
       } catch (SocketException closed) {
         return null;
       }

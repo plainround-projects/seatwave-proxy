@@ -35,7 +35,7 @@ There is no HTML page in the repository. The script is served; a page that loads
 
 ## How it works underneath
 
-**Loading.** The browser asks for the script. SeatWave answers with the bytes (3,703 of them), the media type `text/javascript` and the cache header. A browser or proxy that obeys the header keeps the file for 300 seconds. When the page runs `startSeatPage(container, customer)`, the script draws and starts its timer.
+**Loading.** The browser asks for the script. SeatWave answers with the bytes (4,392 of them), the media type `text/javascript` and the cache header. A browser or proxy that obeys the header keeps the file for 300 seconds. When the page runs `startSeatPage(container, customer)`, the script draws and starts its timer.
 
 **Drawing.** `loadSection` fetches pages of 500 seats from `/v1/events/1/seats?section=A&limit=500&cursor=...` and returns the whole list. `drawSection` turns each seat into a `<button>` and replaces the old children of the container in one step.
 
@@ -130,36 +130,50 @@ function drawSection(container, seats) {
 
 ```javascript
 
-// Holds one seat with an Idempotency-Key, so a retry after a lost reply cannot hold twice.
+// Holds one seat with an Idempotency-Key, so a retry after a lost reply cannot hold twice. Only a
+// lost connection, a 5xx answer or "request-in-progress" (the same key is still running) is tried
+// again; any other answer is final.
+const SEATWAVE_HOLD_ATTEMPTS = 3;
+const SEATWAVE_IN_PROGRESS = "https://seatwave.example/problems/request-in-progress";
+
 async function holdSeat(seat, customer) {
   const key = `"${crypto.randomUUID()}"`;
   const body = JSON.stringify({ eventId: SEATWAVE_EVENT_ID, seat, customer });
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 1; attempt <= SEATWAVE_HOLD_ATTEMPTS; attempt += 1) {
+    let response = null;
     try {
-      const response = await fetch("/v1/holds", {
+      response = await fetch("/v1/holds", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Idempotency-Key": key },
         body,
       });
+    } catch (networkError) {
+      if (attempt === SEATWAVE_HOLD_ATTEMPTS) {
+        throw networkError;
+      }
+    }
+    if (response !== null) {
       if (response.status === 201) {
         return await response.json();
       }
       if (response.status === 409) {
-        return null;
-      }
-      if (response.status < 500) {
+        const problem = await response.json();
+        if (problem.type !== SEATWAVE_IN_PROGRESS) {
+          // The seat is held or sold.
+          return null;
+        }
+      } else if (response.status < 500) {
+        // A 4xx other than 409 says the request itself is wrong; sending it again cannot help.
         throw new Error(`hold answered ${response.status}`);
       }
-    } catch (networkError) {
-      if (attempt === 2) {
-        throw networkError;
-      }
     }
-    // Back off 1, then 2 seconds, with jitter, as Module 4 taught.
-    const backoffMillis = 1000 * 2 ** attempt * (0.5 + Math.random());
-    await new Promise((resolve) => setTimeout(resolve, backoffMillis));
+    if (attempt < SEATWAVE_HOLD_ATTEMPTS) {
+      // Back off 1, then 2 seconds, with jitter, as Module 4 taught.
+      const backoffMillis = 1000 * 2 ** (attempt - 1) * (0.5 + Math.random());
+      await new Promise((resolve) => setTimeout(resolve, backoffMillis));
+    }
   }
-  throw new Error("hold did not succeed after three attempts");
+  throw new Error(`hold did not succeed after ${SEATWAVE_HOLD_ATTEMPTS} attempts`);
 }
 ```
 
@@ -167,22 +181,25 @@ async function holdSeat(seat, customer) {
 
 - ``const key = `"${crypto.randomUUID()}"` `` makes a random identifier and wraps it in double quotes. The server's rule for an Idempotency-Key is a quoted string of printable characters (an RFC 9651 string), so the quotes are part of the value. The key is made once, outside the loop, so every attempt of this click uses the same key.
 - `JSON.stringify({ eventId, seat, customer })` writes the request body as JSON text. Note that `crypto.randomUUID` exists only in a **secure context**: HTTPS, or a page served from `localhost` or `127.0.0.1`. On plain HTTP to another host it is not available and the call fails.
-- The `for` loop runs at most three attempts. Each does `fetch("/v1/holds", { method: "POST", headers: {...}, body })`. The shorthand `body` in the options means `body: body`.
-- Status `201 Created`: return the parsed hold. Status `409`: return `null` (the seat is taken). Any other status below 500: `throw new Error(...)` (a client mistake; no point retrying). A status of 500 or more falls through to the wait and tries again.
-- `try { ... } catch (networkError) { ... }` handles a failed `fetch` (no network). On the last attempt (`attempt === 2`) the error is thrown again; before that it is swallowed so the loop continues to the wait.
-- The wait: `1000 * 2 ** attempt * (0.5 + Math.random())` milliseconds. `2 ** attempt` is two to the power of the attempt number (1, then 2). `Math.random()` gives a number from 0 up to 1, so the factor is from 0.5 to 1.5: the wait is between 0.5 and 1.5 seconds after the first attempt, and between 1 and 3 seconds after the second. This **jitter** stops many clients from retrying at the same instant. `await new Promise((resolve) => setTimeout(resolve, backoffMillis))` is the usual way to sleep in a script.
-- If all three attempts end without a result, the last line throws "hold did not succeed after three attempts".
+- The comment above the function states the retry rule: only a lost connection, a 5xx answer or `request-in-progress` is tried again; any other answer is final. `SEATWAVE_HOLD_ATTEMPTS` (3) and `SEATWAVE_IN_PROGRESS` (the problem `type` the server uses when a request with the same key is still running) are named constants, so the rule reads as words.
+- The `for` loop counts attempts from 1 to 3. Each does `fetch("/v1/holds", { method: "POST", headers: {...}, body })`. The shorthand `body` in the options means `body: body`.
+- Only the `fetch` call is inside `try { ... } catch (networkError) { ... }`. A failed `fetch` (no network) lands in the `catch`: on the last attempt the error is thrown again; before that, `response` stays `null` and the loop goes on to the wait. Keeping the answer checks outside the `try` is the point: a `throw` there cannot be caught by this `catch`.
+- If there is an answer: `201 Created` returns the parsed hold. `409` reads the problem body; if its `type` is anything but `request-in-progress` (in practice `seat-unavailable`), it returns `null`, the seat is taken. A `409 request-in-progress` falls through to the wait and tries again with the same key: the first request may be about to succeed, and the server will then replay its answer. Any other status below 500 throws `hold answered <status>` at once: the request itself is wrong, and sending it again cannot help. A status of 500 or more falls through to the wait.
+- The wait comes only between attempts (`attempt < SEATWAVE_HOLD_ATTEMPTS`), never after the last one: `1000 * 2 ** (attempt - 1) * (0.5 + Math.random())` milliseconds. `2 ** (attempt - 1)` is two to the power of one less than the attempt number (1, then 2). `Math.random()` gives a number from 0 up to 1, so the factor is from 0.5 to 1.5: the wait is between 0.5 and 1.5 seconds after the first attempt, and between 1 and 3 seconds after the second. This **jitter** stops many clients from retrying at the same instant. `await new Promise((resolve) => setTimeout(resolve, backoffMillis))` is the usual way to sleep in a script.
+- If all three attempts end without a result, the last line throws "hold did not succeed after 3 attempts". The backquotes make a **template literal**: `${...}` inside it is replaced by the value.
 
-Two flaws in the retry logic, both confirmed by running `holdSeat` under Node with a fake `fetch` that always answers one status:
+I ran `holdSeat` under Node 24.14.1 with a fake `fetch` that gives scripted answers and a `setTimeout` that counts the waits and returns at once:
 
-| Fake answer | What `holdSeat` did |
+| Fake answers | What `holdSeat` did |
 |---|---|
-| 201 | returned the hold after 1 call |
-| 409 | returned `null` after 1 call |
-| 422 | threw `hold answered 422` after 3 calls and 2 waits |
-| 503 | threw `hold did not succeed after three attempts` after 3 calls and 3 waits |
+| 201 | returned {"holdId":"h1"} after 1 call(s) and 0 wait(s) |
+| 409 seat-unavailable | returned null after 1 call(s) and 0 wait(s) |
+| 409 request-in-progress, then 201 | returned {"holdId":"h2"} after 2 call(s) and 1 wait(s) |
+| 422 | threw `hold answered 422` after 1 call(s) and 0 wait(s) |
+| 503 | threw `hold did not succeed after 3 attempts` after 3 call(s) and 2 wait(s) |
+| no network | threw `network down` after 3 call(s) and 2 wait(s) |
 
-The 422 row shows the first flaw. The `throw new Error("hold answered ...")` for a status below 500 sits inside the `try` block, so the `catch` below it catches it, and on the first two attempts swallows it. A client mistake is therefore retried three times, with waits, before the error reaches the caller. The comment says a 4xx is not retried; the code does retry it. The second flaw is that every 409 means "seat taken" to this code. The server also answers 409 with the type `request-in-progress` when another request with the same key is still running; the script would report that as "seat taken" although the hold may be about to succeed. And the 503 row waits after its last attempt (3 waits for 3 calls) before throwing; the last wait is wasted.
+The first version of this function had two flaws that this table no longer shows. Its 4xx `throw` sat inside the `try`, so its own `catch` swallowed it, and a 422 was sent three times with two waits before the error reached the caller. And it read every 409 as "seat taken", although the server also answers 409 for a request still in progress. It also waited once more after its last attempt.
 
 ```javascript
 
@@ -232,14 +249,14 @@ curl -s -D - -o /dev/null http://127.0.0.1:20931/static/seat-map.js
 
 ```
 HTTP/1.1 200 OK
-Date: Wed, 11 Nov 2026 05:51:38 GMT
+Date: Wed, 11 Nov 2026 06:59:35 GMT
 Content-type: text/javascript
-Server-timing: app;dur=6.37
-Content-length: 3703
+Server-timing: app;dur=5.06
+Content-length: 4392
 Cache-control: public, max-age=300
 ```
 
-`Cache-control: public, max-age=300` is the line that lets a shared cache keep the file for 300 seconds. `3703` is the size of the file.
+`Cache-control: public, max-age=300` is the line that lets a shared cache keep the file for 300 seconds. `4392` is the size of the file in version 1.0.1 (version 1.0.0's script, before the retry rule was fixed, was 3,703 bytes).
 
 **2. Fetch the poster.**
 
@@ -266,11 +283,11 @@ node --check seat-map.mjs && echo syntax ok
 
 It printed `syntax ok`. I ran this with Node 24.14.1, in a scratch folder; Node is not required by the repository.
 
-**5. Reproduce the retry table.** In a scratch folder, copy the script as `sm.mjs` with `async function startSeatPage` in place of `export async function startSeatPage`, add the line `export { holdSeat };` at the end, and run a short file that sets `globalThis.fetch` to return `{ status: 422, json: async () => ({}) }` and calls `await holdSeat("A-7", "fan-1")`. Count the calls. That is how the table above was produced. (Replace `setTimeout` with a function that calls the callback at once, or each run waits several seconds.)
+**5. Reproduce the retry table.** In a scratch folder, copy the script as `sm.mjs` with `async function startSeatPage` in place of `export async function startSeatPage`, add the line `export { holdSeat };` at the end, and run a short file that sets `globalThis.fetch` to return `{ status: 422, json: async () => ({}) }` and calls `await holdSeat("A-7", "fan-1")`. Count the calls. For a 409, return a body with a `type`, such as `{ status: 409, json: async () => ({ type: "https://seatwave.example/problems/request-in-progress" }) }`. That is how the table above was produced. (Replace `setTimeout` with a function that counts and calls the callback at once, or each run waits several seconds.)
 
 ## Mistakes people make
 
-- **Throwing inside a `try` that catches everything.** The 4xx `throw` in `holdSeat` is caught by its own `catch`. Put a client-error `throw` outside the `try`, or rethrow it.
+- **Throwing inside a `try` that catches everything.** A `throw` inside a `try` is caught by that `try`'s own `catch`. `holdSeat` keeps only the `fetch` inside its `try`, so its client-error `throw` reaches the caller; the first version put it inside and retried a 422.
 - **Treating every 409 alike.** The server uses 409 for two different problems (`seat-unavailable` and `request-in-progress`). Read the problem `type`, never the status alone.
 - **Making a new key per retry.** A new key per attempt would make the server hold twice. The key is made once per click.
 - **Retrying without back-off or jitter.** Retries from many clients at the same moment are a load spike. Back-off spreads them.

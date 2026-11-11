@@ -10,7 +10,7 @@ A **terminal** is a window where you type commands. The word after the program n
 
 ## Why this repository uses it
 
-The hands-on project of Module 9 must build and test with one command and the same result on every machine, and it must not need Docker for that. Gradle gives that: `./gradlew check` makes the test certificates, checks the formatting of the code, compiles it with every warning turned into an error, runs 119 tests and fails if the line coverage is below 80 percent. The build file also gives each of the six programs (the backend, the bench, the outage probe, the slow clients, the access-log reader and the report) its own task, so a learner types one short command instead of assembling a long Java command line. It keeps the tests that need the running Compose stack out of `check` (they have their own task, `stackTest`), so the gate takes seconds and needs no Docker. And two tasks prepare the Docker side without Docker: `testCertificates` creates throwaway TLS certificates with the JDK's `keytool`, so no key is ever committed, and `stackPrepare` collects the jars the container image copies.
+The hands-on project of Module 9 must build and test with one command and the same result on every machine, and it must not need Docker for that. Gradle gives that: `./gradlew check` makes the test certificates, checks the formatting of the code, compiles it with every warning turned into an error, runs 166 tests and fails if the line coverage is below 80 percent. The build file also gives each of the six programs (the backend, the bench, the outage probe, the slow clients, the access-log reader and the report) its own task, so a learner types one short command instead of assembling a long Java command line. It keeps the tests that need the running Compose stack out of `check` (they have their own task, `stackTest`), so the gate takes seconds and needs no Docker. And two tasks prepare the Docker side without Docker: `testCertificates` creates throwaway TLS certificates with the JDK's `keytool`, so no key is ever committed, and `stackPrepare` collects the jars the container image copies.
 
 ## Where it appears
 
@@ -94,10 +94,10 @@ plugins {
 
 ```kotlin
 group = "io.plainround"
-version = "1.0.0"
+version = "1.0.1"
 ```
 
-`group` and `version` are the project's own identity in the Maven style: a group, a name (from `settings.gradle.kts`) and a version. They matter in one visible place: `version = "1.0.0"` is part of the name of the jar, `seatwave-proxy-1.0.0.jar`, that `stackFiles` collects.
+`group` and `version` are the project's own identity in the Maven style: a group, a name (from `settings.gradle.kts`) and a version. They matter in one visible place: `version = "1.0.1"` is part of the name of the jar, `seatwave-proxy-1.0.1.jar`, that `stackFiles` collects. The `Dockerfile` names that jar and `compose.yaml` names the image `seatwave-proxy-backend:1.0.1`, so the three change together. (1.0.1 is the review pass; 1.0.0 was the first version.)
 
 ### The Java toolchain
 
@@ -343,14 +343,26 @@ The comment says one certificate serves every TLS endpoint of the lab, and names
 The second `keytool` call, `-importkeystore`, copies one entry from the source store (`-srckeystore caStore`, `-srcstorepass:file`, `-srcalias server`) into a new store (`-destkeystore seatwave-server.p12`, `-deststoretype PKCS12`, `-deststorepass:file`, `-destalias seatwave`). The server's store therefore holds one key under the alias `seatwave`, with its chain of two certificates (the server certificate, then the CA). The server never gets the CA's private key. Then `writePem(serverStore, password, directory)` writes the same key and chain as PEM.
 
 ```kotlin
-        // Readable by the containers' own users (NGINX and SeatWave run under other user ids), and
-        // never committed: .gitignore refuses every one of these file types.
+        // The files the containers read are rw-r--r--: on a Linux host a bind mount keeps the host's
+        // owner and mode, and the containers read them as other users (NGINX's master as root
+        // without CAP_DAC_OVERRIDE, SeatWave as uid 10001), so owner-only files could not be read.
+        // Docker Desktop on a Mac shows every shared file as owned by the user reading it, so there
+        // rw------- works too. The CA's keystore, which holds the CA's private key, is read by no
+        // container and stays rw-------. Nothing here is ever committed: .gitignore refuses these
+        // file types, and the keys are TEST keys made again every day.
         directory.listFiles().orEmpty().forEach { file ->
-            Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString("rw-r--r--"))
+            val mode = if (file.name == "seatwave-test-ca.p12") "rw-------" else "rw-r--r--"
+            Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString(mode))
         }
 ```
 
-The comment gives the reason: the containers' own users (NGINX and SeatWave) run under other user ids, so the files must be readable by them, and "never committed: .gitignore refuses every one of these file types". `directory.listFiles().orEmpty().forEach { file -> ... }` walks over every file in the folder (`orEmpty()` turns a missing list into an empty one). `Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString("rw-r--r--"))` sets each file's **permissions**. A permission string has three groups of three letters for owner, group and others: `r` read, `w` write, `-` not allowed. `rw-r--r--` lets the owner read and write and everyone else only read. It applies to the password file and to the PEM key as well, which is acceptable only because these are throwaway test files that exist on one developer machine.
+The comment gives the reason for each mode, and says what was checked. A file's **permissions** are written as three groups of three letters, for the owner, the group and everyone else: `r` read, `w` write, `-` not allowed. `rw-r--r--` lets the owner read and write and everyone else only read; `rw-------` lets only the owner in.
+
+- The containers read the TEST files as other users: NGINX's main process as root, but without the capability `CAP_DAC_OVERRIDE` (the power to ignore permissions, which `compose.yaml` drops with every other one), and SeatWave as user 10001. On a Linux computer a **bind mount** (a host folder shown inside a container) keeps the host's owner and permissions, so a file only its owner may read could not be read there. That is why the files the containers need are `rw-r--r--`.
+- Docker Desktop on a Mac shares files differently: inside the container, a shared file looks as if it belonged to whoever reads it. The review pass checked this: with every file set to `rw-------`, the stack still started and answered. Owner-only would therefore work on a Mac, but not on Linux, and the build must work on both.
+- `seatwave-test-ca.p12` holds the CA's private key, the key that signs certificates. No container reads it (they need only the CA's certificate, `seatwave-test-ca.pem`), so it is `rw-------` everywhere.
+- `directory.listFiles().orEmpty().forEach { file -> ... }` walks over every file in the folder (`orEmpty()` turns a missing list into an empty one). `val mode = if (...) "rw-------" else "rw-r--r--"` picks the mode by the file's name, and `Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString(mode))` sets it.
+- Readable test keys are acceptable only because they are throwaway TEST files made again every day, kept in `build/`, which `.gitignore` keeps out of every commit.
 
 ```kotlin
     private fun writePem(serverStore: java.io.File, password: String, directory: java.io.File) {
@@ -405,11 +417,11 @@ The comment gives the reason: the containers' own users (NGINX and SeatWave) run
 - `execOperations.exec { ... }` starts the program as a separate operating system process (a running program). Inside: `commandLine(listOf(keytool.get()) + arguments)` is the program path followed by the arguments; `standardOutput = chatter` and `errorOutput = chatter` send both output streams into the buffer; `isIgnoreExitValue = true` stops Gradle from throwing by itself on a non-zero **exit status** (0 means success, anything else means failure), because the next lines do it with a better message.
 - `if (result.exitValue != 0) { throw GradleException(...) }` fails the build if `keytool` returned anything but 0. The message is `keytool <the first argument> failed: ` followed by what `keytool` printed.
 
-On this machine the folder looked like this after the task (names, permissions and sizes only; sizes vary by a few bytes from run to run because the keys are random):
+On this machine the folder looked like this after the task (permissions, sizes and names only; sizes vary by a few bytes from run to run because the keys are random):
 
 ```
 -rw-r--r--@ 1736 seatwave-server.p12
--rw-r--r--@ 2527 seatwave-test-ca.p12
+-rw-------@ 2527 seatwave-test-ca.p12
 -rw-r--r--@ 650 seatwave-test-ca.pem
 -rw-r--r--@ 1303 server-chain.pem
 -rw-r--r--@ 148 server-key.pem
@@ -447,7 +459,11 @@ tasks.test {
     dependsOn(testCertificates)
     systemProperty("seatwave.tls.directory", layout.buildDirectory.dir("tls").get().asFile.absolutePath)
     systemProperty("seatwave.nginx.directory", file("nginx").absolutePath)
+    // The configuration rules read these files too, so a change to any of them runs the tests again.
     inputs.dir("nginx")
+    inputs.dir("config")
+    inputs.file("compose.yaml")
+    inputs.file("Dockerfile")
     testLogging {
         events("passed", "failed", "skipped")
     }
@@ -460,7 +476,7 @@ tasks.test {
 - `useJUnitPlatform { excludeTags("stack") }` tells it to run tests through the JUnit Platform, and to skip every test marked `@Tag("stack")`. Without `useJUnitPlatform` Gradle would look for older JUnit 4 tests and find none.
 - `dependsOn(testCertificates)` makes `test` wait for the certificate task. This is how a test never starts before `build/tls` exists.
 - `systemProperty("seatwave.tls.directory", layout.buildDirectory.dir("tls").get().asFile.absolutePath)` is how the tests find the certificates. A **system property** is a named text value that Gradle gives to the test JVM, like a variable that every class can read. The value is an absolute path to `build/tls` of the checkout, so it does not matter which folder the test JVM starts in. `systemProperty("seatwave.nginx.directory", file("nginx").absolutePath)` does the same for the folder of NGINX configuration files, which some tests read and check (`tests-stack-walkthrough.md`).
-- `inputs.dir("nginx")` tells Gradle that the `nginx/` folder is an input of the task: if a file in it changes, `test` is not up to date and runs again.
+- `inputs.dir("nginx")`, `inputs.dir("config")`, `inputs.file("compose.yaml")` and `inputs.file("Dockerfile")` tell Gradle that these folders and files are inputs of the task: if one of them changes, `test` is not up to date and runs again. The tests read all of them (the configuration rules in `NginxConfigRulesTest`, the settings files in several tests). Gradle cannot see a file that a test opens by itself, so without these lines an edit to `compose.yaml` left `test` "UP-TO-DATE" and nothing was checked; the comment above them says why they are there. (Version 1.0.0 named only `nginx/`.)
 - `testLogging { events("passed", "failed", "skipped") }` prints one line per test result while the task runs, for example `BackendCliTest > saysWhichTlsFileIsMissing(Path) PASSED`. Without it, only failures show.
 - `finalizedBy(tasks.jacocoTestReport)` means: after `test` finishes, always run `jacocoTestReport`, even if tests failed. That creates the coverage report in `build/reports/jacoco/test/html`.
 
@@ -665,7 +681,7 @@ ls build/stack/lib
 - **Thinking `test` is enough.** `./gradlew test` skips the formatter check and the coverage floor. Only `check` runs all three.
 - **Expecting `check` to prove the proxy works.** The tests tagged `stack` are left out of `check`. They run only through `stackTest` against a running stack.
 - **Running a test class from an editor without Gradle.** The tests need the system properties `seatwave.tls.directory` and `seatwave.nginx.directory`; only the Gradle `test` task sets them, and only after `testCertificates` has made the files.
-- **Working in a folder with a very long path.** The settings readers accept key store paths of at most 200 characters, and the `test` task passes an absolute path. In a folder whose `build/tls/seatwave-server.p12` path is 218 characters long, two tests failed (`BackendCliTest` and `BenchCliTest`) until the property was a short relative path. Keep the project in a short path (`java-properties.md`).
+- **A settings rule that does not fit real paths.** The `test` task passes an absolute path to `build/tls`. In version 1.0.0 the settings readers accepted key store paths of at most 200 characters, so in a folder whose `build/tls/seatwave-server.p12` path was 218 characters long two tests failed (`BackendCliTest` and `BenchCliTest`). Version 1.0.1 accepts any path without control characters (`java-properties.md`).
 - **Looking for the XML report in the wrong place.** It is `build/reports/jacoco/test/jacocoTestReport.xml`, written only because of the `xml.required = true` line.
 - **Committing anything from `build/tls`.** The folder is ignored on purpose (`git.md`).
 - **Forgetting that the build file runs.** It is a program. Typing mistakes show up as Kotlin errors, not as friendly messages.

@@ -16,7 +16,7 @@ The lesson puts a reverse proxy in front of SeatWave, and the proxy has to find 
 
 | Path | What it does with Docker |
 |---|---|
-| `Dockerfile` | The recipe for the SeatWave backend image `seatwave-proxy-backend:1.0.0`, in two stages. |
+| `Dockerfile` | The recipe for the SeatWave backend image `seatwave-proxy-backend:1.0.1`, in two stages. |
 | `.dockerignore` | Lists what must stay out of the build context (the folder Docker reads when it builds), above all the TEST keys. |
 | `compose.yaml` | The `backend` service builds this image (`build: .`); the `tools` service reuses it. See `docker-compose.md`. |
 | `scripts/stack.sh` | Runs `docker compose ... up -d --build`, which builds the image. See `shell-scripts-walkthrough.md`. |
@@ -53,7 +53,7 @@ Lines 1 to 3 are comments (a line that starts with `#` is ignored by Docker). Th
 FROM eclipse-temurin:25.0.5_8-jdk-noble@sha256:95e350ad1eb738f943e141640f7e3d797e483359a3b33c3864255bfd1ad71f8a AS runtime
 COPY build/stack/lib/ /app/lib/
 RUN modules="$(jdeps --print-module-deps --ignore-missing-deps --multi-release 25 \
-        --class-path '/app/lib/*' /app/lib/seatwave-proxy-1.0.0.jar)" \
+        --class-path '/app/lib/*' /app/lib/seatwave-proxy-1.0.1.jar)" \
     && echo "linking modules: ${modules}" \
     && jlink --add-modules "${modules}" --strip-debug --no-man-pages --no-header-files \
         --output /opt/seatwave-java
@@ -68,7 +68,7 @@ RUN modules="$(jdeps --print-module-deps --ignore-missing-deps --multi-release 2
   - `--ignore-missing-deps` does not stop when a library refers to something that is not present. Optional dependencies are normal.
   - `--multi-release 25` chooses which version of a "multi-release jar" to read. Some jars hold a different copy of a class for each Java version. 25 is the one this image runs.
   - `--class-path '/app/lib/*'` tells `jdeps` where to find the libraries. The single quotes stop the shell from expanding the `*` itself. The tool understands `*` as "every jar in this folder".
-  - `/app/lib/seatwave-proxy-1.0.0.jar` is the jar to analyze.
+  - `/app/lib/seatwave-proxy-1.0.1.jar` is the jar to analyze. The version in the name comes from `version = "1.0.1"` in `build.gradle.kts`, so the two must change together.
 - The `\` at the end of a line means "the command continues on the next line". Lines 10 and 11 are the rest of the `jdeps` command.
 - Line 11 reads `&& echo "linking modules: ${modules}" \`. `&&` means "run the next command only if the one before it succeeded". If `jdeps` fails, the build stops. The `echo` prints the list so you can see it in the build output. The real output on this machine was `linking modules: java.base,java.desktop,java.net.http,java.sql,jdk.httpserver`.
 - Line 12 reads `&& jlink --add-modules "${modules}" --strip-debug --no-man-pages --no-header-files \`. `jlink` is the JDK tool that builds a custom runtime.
@@ -80,26 +80,27 @@ RUN modules="$(jdeps --print-module-deps --ignore-missing-deps --multi-release 2
 
 ```dockerfile
 # Stage 2: the plain operating system image and the linked runtime, run by a user without a
-# login, a home folder or any rights beyond reading the application.
+# login, a home folder or any rights beyond reading the application. 10001 is above Ubuntu's
+# range of system user ids (up to 999), so it is an ordinary user; /nonexistent is Debian's
+# name for "no home folder", which it really does not have.
 FROM ubuntu:noble@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
-RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin seatwave
+RUN useradd --uid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin seatwave
 COPY --from=runtime /opt/seatwave-java /opt/seatwave-java
 COPY --from=runtime /app/lib/ /app/lib/
 COPY config/ /app/config/
 USER 10001
 ```
 
-- Lines 15 and 16 are comments: the final image is the plain operating system image plus the linked runtime, run by a user "without a login, a home folder or any rights beyond reading the application".
-- Line 17 starts stage 2 with `FROM ubuntu:noble@sha256:fe8156...`. This is Ubuntu 24.04 without Java. Its layer is about 101 MB; the linked runtime layer that arrives later is 93.8 MB. Both numbers come from `docker image history` below. Nothing from stage 1 is here yet.
-- Line 18 is `RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin seatwave`. It creates an operating-system user named `seatwave`.
-  - `--system` makes a service account (no password, no expiry).
-  - `--uid 10001` fixes the numeric user id. A high number does not collide with any real account.
-  - `--no-create-home` does not create the home folder. I checked: `/etc/passwd` names `/home/seatwave`, but the folder does not exist.
+- Lines 15 to 18 are comments: the final image is the plain operating system image plus the linked runtime, run by a user "without a login, a home folder or any rights beyond reading the application". They also say why the user is made the way line 20 makes it.
+- Line 19 starts stage 2 with `FROM ubuntu:noble@sha256:fe8156...`. This is Ubuntu 24.04 without Java. Its layer is about 101 MB; the linked runtime layer that arrives later is 93.8 MB. Both numbers come from `docker image history` below. Nothing from stage 1 is here yet.
+- Line 20 is `RUN useradd --uid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin seatwave`. It creates an operating-system user named `seatwave`.
+  - `--uid 10001` fixes the numeric user id. A high number does not collide with any real account. Ubuntu keeps the numbers up to 999 for **system accounts** (the users of services that come with the system). 10001 is above that range, so this is an ordinary user, and `useradd` is not given `--system`. (The first version of this file did pass `--system`, and every build printed `useradd warning: seatwave's uid 10001 is greater than SYS_UID_MAX 999`.)
+  - Without `--system`, `useradd` also makes a group of the same name with the same number, so the user's group is 10001 as well.
+  - `--no-create-home` does not create a home folder, and `--home-dir /nonexistent` writes that fact into `/etc/passwd`. `/nonexistent` is the name Debian and Ubuntu use for "this user has no home folder": the folder really does not exist. Before, `/etc/passwd` named `/home/seatwave`, a folder that was never made.
   - `--shell /usr/sbin/nologin` means nobody can log in as this user.
-  - During the build, `useradd` prints `useradd warning: seatwave's uid 10001 is greater than SYS_UID_MAX 999`. It is only a warning: system accounts are normally numbered below 1000, and the build goes on.
-- Line 19 is `COPY --from=runtime /opt/seatwave-java /opt/seatwave-java`. `--from=runtime` takes the files from stage 1 (named `runtime` on line 7), not from the build context. This is how the linked runtime arrives without the JDK.
-- Line 20 copies the jars from stage 1 the same way. Line 21 copies the folder `config/` from the build context: the settings files, including `config/backend-container.properties` (see `java-properties.md`).
-- Line 22 is `USER 10001`. Everything after it, and the container's main program, runs as user 10001. The number (not the name) is used so a platform can check that the user is not root without reading the image's `/etc/passwd`. `docker exec ... id` printed `uid=10001(seatwave) gid=999(seatwave) groups=999(seatwave)`.
+- Line 21 is `COPY --from=runtime /opt/seatwave-java /opt/seatwave-java`. `--from=runtime` takes the files from stage 1 (named `runtime` on line 7), not from the build context. This is how the linked runtime arrives without the JDK.
+- Line 22 copies the jars from stage 1 the same way. Line 23 copies the folder `config/` from the build context: the settings files, including `config/backend-container.properties` (see `java-properties.md`).
+- Line 24 is `USER 10001`. Everything after it, and the container's main program, runs as user 10001. The number (not the name) is used so a platform can check that the user is not root without reading the image's `/etc/passwd`. In the review pass's rebuilt image, `docker exec ... id` printed `uid=10001(seatwave) gid=10001(seatwave) groups=10001(seatwave)`. (Version 1.0.0's image, made with `--system`, gave the group the system number 999.)
 
 ### How the program starts
 
@@ -112,13 +113,13 @@ ENTRYPOINT ["/opt/seatwave-java/bin/java", "-XX:MaxRAMPercentage=50", "-Dsun.net
 CMD ["io.plainround.seatwave.proxy.backend.BackendCli", "/app/config/backend-container.properties"]
 ```
 
-- Lines 23 to 26 are comments. The first says why the exec form is used (see below). The second is a measured fact about this lab: the JDK's built-in HTTP server leaves **Nagle's algorithm** on by default. Nagle's algorithm makes the operating system wait a short time to join small writes into one packet. A response's headers and body leave as two small writes, and on the sidecar's loopback link the body waited about 40 ms for every request. The switch `-Dsun.net.httpserver.nodelay=true` turns it off. `ARCHITECTURE.md` records the same decision, and `reverse-proxy-concepts.md` explains the sidecar.
-- Line 27 is `ENTRYPOINT [...]` in **exec form**: a JSON list. Docker starts exactly this program with exactly these arguments, with no shell in between. That makes Java **process 1** in the container. `docker stop` sends the signal SIGTERM to process 1; with a shell in the way the signal would not reach Java. The Java program has a shutdown hook (a piece of code that runs when the program is asked to stop) that closes its listeners.
+- Lines 25 to 28 are comments. The first says why the exec form is used (see below). The second is a measured fact about this lab: the JDK's built-in HTTP server leaves **Nagle's algorithm** on by default. Nagle's algorithm makes the operating system wait a short time to join small writes into one packet. A response's headers and body leave as two small writes, and on the sidecar's loopback link the body waited about 40 ms for every request. The switch `-Dsun.net.httpserver.nodelay=true` turns it off. `ARCHITECTURE.md` records the same decision, and `reverse-proxy-concepts.md` explains the sidecar.
+- Line 29 is `ENTRYPOINT [...]` in **exec form**: a JSON list. Docker starts exactly this program with exactly these arguments, with no shell in between. That makes Java **process 1** in the container. `docker stop` sends the signal SIGTERM to process 1; with a shell in the way the signal would not reach Java. The Java program has a shutdown hook (a piece of code that runs when the program is asked to stop) that closes its listeners.
   - `/opt/seatwave-java/bin/java` is the runtime that `jlink` made.
   - `-XX:MaxRAMPercentage=50` lets the Java heap grow to half of the container's memory limit. With `mem_limit: 1g` that is about 512 MiB.
   - `-Dsun.net.httpserver.nodelay=true` sets a **system property**, a named setting the JDK's HTTP server reads. It is the TCP_NODELAY switch from the comment.
   - `-cp`, `"/app/lib/*"` is the class path. Java expands `/app/lib/*` itself to every jar in the folder. This is why no shell is needed.
-- Line 28 is `CMD [...]`. In exec form, `CMD` supplies the default **arguments** after the entry point: here the main class `io.plainround.seatwave.proxy.backend.BackendCli` and the settings file `/app/config/backend-container.properties`. If you pass arguments to `docker run`, they replace `CMD`. The `tools` service in `compose.yaml` replaces the entry point as well.
+- Line 30 is `CMD [...]`. In exec form, `CMD` supplies the default **arguments** after the entry point: here the main class `io.plainround.seatwave.proxy.backend.BackendCli` and the settings file `/app/config/backend-container.properties`. If you pass arguments to `docker run`, they replace `CMD`. The `tools` service in `compose.yaml` replaces the entry point as well.
 
 ### The ignore file
 
@@ -139,7 +140,7 @@ I checked the result: a container started from the image and asked to list `/run
 
 ## Try it yourself
 
-I ran these in a copy of the repository on 11 November 2026 with Docker 24.0.6 and Compose v2.23.0-desktop.1. Timings and layer sizes differ on every machine. I used the Compose project name `seatwave-proxy-notes`; you can leave the name out.
+I ran these in a copy of the repository on 11 November 2026 with Docker 24.0.6 and Compose v2.23.0-desktop.1, on version 1.0.0 of the project. Timings and layer sizes differ on every machine. I used the Compose project name `seatwave-proxy-notes`; you can leave the name out. Version 1.0.1 changed three things you will see: the image is called `seatwave-proxy-backend:1.0.1` (use that name in the commands), the `useradd` warning line is gone (the review pass rebuilt the image and its output had no warning), the `useradd` layer no longer says `--system`, and `id` prints group 10001 instead of 999. The outputs below are the 1.0.0 ones, unchanged.
 
 1. Collect the jars, then rebuild the backend image without the cache and show only the interesting lines:
 

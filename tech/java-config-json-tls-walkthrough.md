@@ -79,6 +79,11 @@ The Javadoc states the contract. There are no defaults. When a key is invalid th
 ```java
 public final class SettingsReader {
 
+  // A path as a file system can hold it: any character but a control character (a line break or a
+  // NUL cannot be part of a real file name), up to 4,096 characters, Linux's PATH_MAX. Spaces, "+"
+  // and deep folders are allowed, because a reader's checkout may sit in any of them.
+  private static final Pattern FILE_PATH = Pattern.compile("[^\\p{Cntrl}]{1,4096}");
+
   private final Properties properties;
   private final List<String> problems = new ArrayList<>();
 
@@ -94,13 +99,16 @@ public final class SettingsReader {
 
 The reader keeps the `Properties` and an `ArrayList` of problem lines. The constructor refuses `null`.
 
+`FILE_PATH` is the rule for a value that names a file. `\p{Cntrl}` is the regular-expression class of **control characters**: the invisible characters such as a line break, a tab or the NUL byte, which no real file name holds. `[^...]` means "any character except these", and `{1,4096}` allows one to 4,096 of them. 4,096 is `PATH_MAX` on Linux, the longest path the kernel accepts. A space, a `+` and a deep folder are all allowed. The first version used `[A-Za-z0-9_./-]{1,200}` instead, a rule meant to keep settings tidy. It refused every real path with a space or a `+`, and every path longer than 200 characters, so the tests that write the absolute `build/tls` path into a settings file failed in a checkout deeper than about 170 characters or in a folder with a space. The review pass ran `./gradlew check` in a checkout 270 characters deep and in a folder named `folder with space+plus`; both passed.
+
 ```java
   /**
    * Loads a settings file as UTF-8.
    *
    * @param path the file
    * @return the loaded properties
-   * @throws IOException if the file does not exist or cannot be read; the message says which
+   * @throws IOException if the file does not exist, cannot be read or is not a properties file; the
+   *     message says which
    */
   public static Properties load(Path path) throws IOException {
     Objects.requireNonNull(path, "path");
@@ -109,12 +117,22 @@ The reader keeps the `Properties` and an `ArrayList` of problem lines. The const
       properties.load(reader);
     } catch (NoSuchFileException missing) {
       throw new IOException("the settings file " + path + " does not exist", missing);
+    } catch (IllegalArgumentException malformed) {
+      // Properties.load refuses a broken escape (a backslash and a u with fewer than four hex
+      // digits) with this unchecked exception; a typo in a settings file is an expected failure,
+      // so it is reported like an unreadable file.
+      throw new IOException(
+          "the settings file "
+              + path
+              + " is not a valid properties file: "
+              + malformed.getMessage(),
+          malformed);
     }
     return properties;
   }
 ```
 
-`load` is a static method that reads a file. `Files.newBufferedReader(path, StandardCharsets.UTF_8)` opens it as UTF-8 text; the `try (Reader reader = ...)` form closes the reader on every path. `properties.load(reader)` parses the lines. If the file does not exist, `NoSuchFileException` (a kind of `IOException`) is caught and replaced with an `IOException` whose message names the file, `the settings file ... does not exist`, keeping the original as the cause. `Properties.load` also throws `IllegalArgumentException` for a malformed `\u` escape; that case is not caught anywhere (see `SettingsFiles` below).
+`load` is a static method that reads a file. `Files.newBufferedReader(path, StandardCharsets.UTF_8)` opens it as UTF-8 text; the `try (Reader reader = ...)` form closes the reader on every path. `properties.load(reader)` parses the lines. If the file does not exist, `NoSuchFileException` (a kind of `IOException`) is caught and replaced with an `IOException` whose message names the file, `the settings file ... does not exist`, keeping the original as the cause. `Properties.load` has one more way to fail: an **escape** `\u` followed by fewer than four hexadecimal digits (a properties file may write any character as `\u` and four digits, so `\u0041` is `A`). For that, `Properties.load` throws `IllegalArgumentException`, an unchecked exception that callers do not expect. The second `catch` turns it into an `IOException` too, so every caller handles a broken file the same way. For a file holding `http.bindAddress=\u12` the message is `the settings file <the path> is not a valid properties file: Malformed \uxxxx encoding.` (the last part is the JDK's own wording; I ran it in a copy of the repository).
 
 ```java
   /**
@@ -191,6 +209,20 @@ The reader keeps the `Properties` and an `ArrayList` of problem lines. The const
 ```
 
 `textMatching` reads a text that must match a regular expression (a pattern for text). `allowed.matcher(text).matches()` is true only if the whole text fits. A mismatch records `key must match <pattern>, but was <text>` and returns an empty string.
+
+```java
+  /**
+   * Reads a file path.
+   *
+   * @param key the key
+   * @return the trimmed path, or an empty string if the key is missing or holds a control character
+   */
+  public String filePath(String key) {
+    return textMatching(key, FILE_PATH);
+  }
+```
+
+`filePath` is `textMatching` with the `FILE_PATH` rule. The three settings classes that read a file path (`BackendSettings` for `tls.keystore` and `tls.passwordFile`, `BenchSettings` and `ProbeSettings` for `tls.authorityPem`) call it, so one rule decides what a path may hold. Before, each class had its own copy of the old pattern.
 
 ```java
 
@@ -337,7 +369,7 @@ A final class with a private constructor, holding one static method.
 }
 ```
 
-An `IOException` (a missing or unreadable file) is caught: the message is printed and the result is empty. Only `IOException` is caught. A malformed `\u` escape in the file makes `Properties.load` throw `IllegalArgumentException`, which passes through here uncaught. A run of `SettingsFiles.load` on a file with the line `http.bindAddress=\u12` threw `java.lang.IllegalArgumentException: Malformed \uxxxx encoding.` instead of printing a problem line, and `BackendCli`'s promise of exit status 2 for an invalid settings file would not hold for that file.
+An `IOException` (a missing or unreadable file) is caught: the message is printed and the result is empty. Only `IOException` is caught. A malformed `\u` escape in the file makes `Properties.load` throw `IllegalArgumentException`, which passes through here uncaught. In the first version `IllegalArgumentException` passed through here uncaught: a file with the line `http.bindAddress=\u12` stopped `BackendCli` with a stack trace instead of a problem line and exit status 2. Since `SettingsReader.load` turns that case into an `IOException` (above), this one `catch` covers it, and `BackendCliTest.refusesASettingsFileWithABrokenEscapeWithoutAStackTrace` checks it.
 
 ### `json/JsonCodec.java`
 
@@ -350,6 +382,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.exc.InputCoercionException;
+import com.fasterxml.jackson.core.exc.StreamReadException;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.MapperFeature;
@@ -382,9 +415,13 @@ public final class JsonCodec {
 
   // RFC 6901: the empty pointer is the whole document.
   private static final String WHOLE_BODY = "";
+  // Jackson has no exception type of its own for a repeated field; STRICT_DUPLICATE_DETECTION
+  // reports it as a parse error with this message, so the message is the only signal. A test pins
+  // it, so a Jackson version that words it differently fails the build instead of the reason.
+  private static final String DUPLICATE_MESSAGE = "Duplicate field '";
 ```
 
-The Javadoc lists the refusals: unknown fields, `null` for numbers, a value of the wrong type, a number out of range, trailing data and duplicate fields. It also says the codec is thread-safe: the mapper is configured once in the constructor and only read afterwards.
+The Javadoc lists the refusals: unknown fields, `null` for numbers, a value of the wrong type, a number out of range, trailing data and duplicate fields. `DUPLICATE_MESSAGE` is the start of the text Jackson writes when a field appears twice (`Duplicate field 'eventId'`). The comment says why a message is used at all: Jackson has no exception type of its own for this case, so its message is the only way to tell a repeated field from broken JSON. `JsonCodecTest.namesAFieldThatAppearsTwice` pins it, so a Jackson version that words it differently fails the build. It also says the codec is thread-safe: the mapper is configured once in the constructor and only read afterwards.
 
 ```java
   private final ObjectMapper mapper =
@@ -446,14 +483,12 @@ The mapper is built once, as a field, by a **builder** (`JsonMapper.builder()...
         return Result.error(new BindingProblem(WHOLE_BODY, "the body must be a JSON object"));
       }
       T value = mapper.readValue(parser, type);
-      if (parser.nextToken() != null) {
-        return Result.error(
-            new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"));
-      }
-      return Result.success(value);
+      return hasMore(parser)
+          ? Result.error(new BindingProblem(WHOLE_BODY, "the body has data after the JSON object"))
+          : Result.success(value);
 ```
 
-The parser is driven by hand so that three cases get their own message. `parser.nextToken()` reads the first token. `null` means the text was empty: the message is "the body is empty; send a JSON object". If the first token is not `{` the message is "the body must be a JSON object". `mapper.readValue(parser, type)` then binds the object to the record. After it, `parser.nextToken()` must be `null` (nothing left); if there is more, the message is "the body has data after the JSON object". The `try (JsonParser parser = ...)` closes the parser. `WHOLE_BODY` is the empty JSON pointer.
+The parser is driven by hand so that three cases get their own message. `parser.nextToken()` reads the first token. `null` means the text was empty: the message is "the body is empty; send a JSON object". If the first token is not `{` the message is "the body must be a JSON object". `mapper.readValue(parser, type)` then binds the object to the record. After it, `hasMore(parser)` (below) says whether anything follows the object; if so, the message is "the body has data after the JSON object". The `?` and `:` form is the **conditional operator**: `condition ? a : b` is `a` when the condition is true and `b` otherwise. The `try (JsonParser parser = ...)` closes the parser. `WHOLE_BODY` is the empty JSON pointer.
 
 ```java
     } catch (UnrecognizedPropertyException unknownField) {
@@ -469,6 +504,14 @@ The parser is driven by hand so that three cases get their own message. `parser.
             new BindingProblem(pointerOf(unbound), "is out of range for this field"));
       }
       return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
+    } catch (StreamReadException malformed) {
+      if (malformed.getOriginalMessage().startsWith(DUPLICATE_MESSAGE)
+          && malformed.getProcessor() != null) {
+        // The parser stopped on the repeated name, so its context is the path of that field.
+        String pointer = malformed.getProcessor().getParsingContext().pathAsPointer().toString();
+        return Result.error(new BindingProblem(pointer, "appears more than once"));
+      }
+      return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (JacksonException malformed) {
       return Result.error(new BindingProblem(WHOLE_BODY, "the body is not valid JSON"));
     } catch (IOException notReadable) {
@@ -482,10 +525,11 @@ The `catch` blocks run from the most specific failure to the most general; Java 
 - `UnrecognizedPropertyException`: a field not in the record. The pointer is `/` plus the escaped field name, and the detail is "is not a field of this request".
 - `MismatchedInputException`: a value of the wrong type. The pointer comes from `pointerOf`, the detail is "has the wrong type".
 - `JsonMappingException`: other binding failures. A number that is valid JSON but too big for the field (`99999999999999999999` for a `long`) arrives here with an `InputCoercionException` as its cause, and the detail is "is out of range for this field". Anything else is "the body is not valid JSON".
-- `JacksonException`: any other parse failure, such as `{"eventId":`: "the body is not valid JSON".
+- `StreamReadException`: a failure while reading the text itself, before any binding. One case gets its own answer: a repeated field. `malformed.getOriginalMessage()` is Jackson's message without the location it adds; if it starts with `DUPLICATE_MESSAGE`, the parser (`getProcessor()`) is still standing on the repeated name, and `getParsingContext().pathAsPointer()` turns its position into a JSON pointer such as `/eventId`. The detail is "appears more than once". Any other read failure is "the body is not valid JSON". The `!= null` check is there because an exception may carry no parser.
+- `JacksonException`: any other parse failure: "the body is not valid JSON".
 - `IOException`: cannot happen when reading from a string, so it becomes an unchecked exception.
 
-A body with the same field twice is reported as "the body is not valid JSON", as a local run confirmed. The text is not accurate: the JSON is well formed, and the refused thing is the repeated field. The Javadoc promises a reason "that names the field"; for a duplicate it does not.
+A body with the same field twice, `{"eventId":1,"eventId":2,...}`, is answered with the pointer `/eventId` and "appears more than once", the reason "that names the field" the Javadoc promises. (The first version answered "the body is not valid JSON" here, which was not accurate: the JSON was well formed.)
 
 ```java
 
@@ -506,6 +550,20 @@ A body with the same field twice is reported as "the body is not valid JSON", as
 ```
 
 `write` turns a record, a list or a map into JSON text with `writeValueAsString`. A failure to write is a programming error, so it becomes `IllegalArgumentException`. Records are written with their fields in declaration order.
+
+```java
+  private static boolean hasMore(JsonParser parser) throws IOException {
+    try {
+      return parser.nextToken() != null;
+    } catch (JacksonException notJson) {
+      // Text after the object that is not JSON at all ("{...} x") is still data after the object,
+      // and that is the reason the client needs, not "not valid JSON".
+      return true;
+    }
+  }
+```
+
+`hasMore` asks the parser for one more token after the object. `null` means the text ended: nothing follows. A token means more JSON follows, for example a second object. The `catch` is the case the first version got wrong: text after the object that is not JSON at all, such as `{...} x`, makes `nextToken()` throw, because `x` is not a JSON token. That is still data after the object, so the method answers `true`, and the client reads "the body has data after the JSON object" instead of "the body is not valid JSON". The exception is not lost: catching it is how the method gives its answer.
 
 ```java
 
@@ -596,7 +654,20 @@ public final class TlsFiles {
     char[] password = password(passwordFile);
     try (InputStream in = open(keystore)) {
       KeyStore store = KeyStore.getInstance("PKCS12");
-      store.load(in, password);
+      try {
+        store.load(in, password);
+      } catch (IOException wrongPassword) {
+        // KeyStore.load reports a wrong password as an IOException with the JDK's own wording; the
+        // message names both files, so a reader knows which pair does not match.
+        throw new IOException(
+            "the keystore "
+                + keystore
+                + " cannot be opened with the password in "
+                + passwordFile
+                + ": "
+                + wrongPassword.getMessage(),
+            wrongPassword);
+      }
       KeyManagerFactory keys =
           KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
       keys.init(store, password);
@@ -613,11 +684,11 @@ public final class TlsFiles {
 
 1. `password(passwordFile)` reads the password (below) as a `char[]`.
 2. `open(keystore)` opens the key store file.
-3. `KeyStore.getInstance("PKCS12")` makes an empty key store object of that format, and `store.load(in, password)` fills it from the file. A wrong password fails here.
+3. `KeyStore.getInstance("PKCS12")` makes an empty key store object of that format, and `store.load(in, password)` fills it from the file. A wrong password fails here, with an `IOException` whose message is only the JDK's `keystore password was incorrect`. The inner `try` catches it and throws a new `IOException` that names both files, so the reader knows which key store and which password file do not belong together: `the keystore build/tls/seatwave-server.p12 cannot be opened with the password in <the file>: keystore password was incorrect` (I ran it in a copy of the repository with a wrong password file). The original exception stays attached as the cause.
 4. `KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())` makes the helper that finds keys, and `keys.init(store, password)` points it at the store. A **key manager** is the part of TLS that picks the private key and the certificate chain to present.
 5. `SSLContext.getInstance("TLS")` makes a context, and `context.init(keyManagers, null, null)` sets it up: the two `null`s mean "use the default trust list and the default random-number source".
 
-Any `GeneralSecurityException` (a bad key store, a wrong password) is wrapped in an `IOException` that names the key store, so callers handle one kind of failure.
+Any `GeneralSecurityException` (a key store the security code cannot use, such as one with no usable key) is wrapped in an `IOException` that names the key store, so callers handle one kind of failure.
 
 ```java
   /**
@@ -753,10 +824,10 @@ They pass. Note that the `json` package has no test file of its own; only the un
 - **Defaults hidden in code.** A forgotten key then runs with a value nobody chose. Here a missing key is reported.
 - **Stopping at the first problem.** One error per run is slow. The reader collects them all.
 - **Lenient JSON.** Silent conversions (`"1"` to 1, `1.5` to 1, a repeated field, an ignored unknown field) hide client bugs and open mass assignment. Each is switched off, with a comment that says why.
-- **Catching too little.** `SettingsFiles` catches `IOException` only; a malformed `\u` escape escapes it.
+- **Catching too little.** `Properties.load` throws an unchecked `IllegalArgumentException` for a broken `\u` escape. A caller that catches only `IOException` lets it through as a stack trace; this repository converts it once, inside `SettingsReader.load`, where every caller passes.
 - **A password in a command line or a log.** The password is read from a file, kept as a `char[]`, and never printed.
 - **Trusting the system's authorities in a test.** The test client trusts only the TEST CA, so a test cannot pass by accident against a real certificate.
-- **Long paths.** `BackendSettings` limits file paths to 200 characters (see `java-backend-walkthrough-1.md`), so a deep clone folder breaks the test that builds a settings file from the build folder's absolute path.
+- **A path rule stricter than real paths.** Version 1.0.0 limited file paths to 200 characters of letters, digits and `_ . / -`, so a deep clone folder, or one with a space, broke the tests that build a settings file from the build folder's absolute path. `FILE_PATH` now refuses only control characters.
 
 ## Check yourself
 

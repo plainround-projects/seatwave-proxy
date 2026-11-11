@@ -14,9 +14,9 @@ Four ideas are needed:
 
 ## Why this repository uses it
 
-The module is about a proxy in front of a server, and a question the proxy raises is "which line in the proxy's log and which line in SeatWave's log belong to the same request?" NGINX gives each request an id (`$request_id`) and passes it on in the header `X-Request-ID`. SeatWave puts that id in the MDC, so every SeatWave log line of a request shows the same id as the proxy's access-log line (`nginx-config-walkthrough.md`). The comment at the top of `logback.xml` states this goal: "so a proxy log line and a SeatWave log line can be joined."
+The module is about a proxy in front of a server, and a question the proxy raises is "which line in the proxy's log and which line in SeatWave's log belong to the same request?" NGINX gives each request an id (`$request_id`) and passes it on in the header `X-Request-ID`. SeatWave puts that id in the MDC, so every SeatWave log line of a request shows the same id as the proxy's access-log line (`nginx-config-walkthrough-1.md`). The comment at the top of `logback.xml` states this goal: "so a proxy log line and a SeatWave log line can be joined."
 
-A second reason is that the logs go to standard error, so a command's report on standard output stays clean (`java-bench-walkthrough.md`, `java-report-logs-walkthrough.md`).
+A second reason is that the logs go to standard error, so a command's report on standard output stays clean (`java-bench-walkthrough-2.md` for `BenchCli`, `java-report-logs-walkthrough-1.md` for `ReportCli` and `java-report-logs-walkthrough-2.md` for `LogStatsCli`).
 
 ## Where it appears
 
@@ -186,7 +186,7 @@ CP=$(find ~/.gradle -name 'slf4j-api-2.0.20.jar'|head -1):$(find ~/.gradle -name
 java -cp "cfg:$CP" L.java 2>err.txt; cat err.txt
 ```
 
-   Expected: nothing on standard output, and in `err.txt` four lines such as `06:00:08.598 INFO  [none] L - no id yet, 3 seats`, `06:00:08.600 INFO  [abc123] L - held A-1 for 300 s`, `06:00:08.600 WARN  [abc123] L - a warning` and `06:00:08.600 INFO  [none] L - after clear`. The times differ on every run. There is no `DEBUG` line, because the root level is `INFO`. (I put the `cfg` folder first on purpose: with the folder last on the class path, my run failed with a `NoClassDefFoundError` for a Logback class.)
+   Expected: nothing on standard output, and in `err.txt` four lines such as `06:00:08.598 INFO  [none] L - no id yet, 3 seats`, `06:00:08.600 INFO  [abc123] L - held A-1 for 300 s`, `06:00:08.600 WARN  [abc123] L - a warning` and `06:00:08.600 INFO  [none] L - after clear`. The times differ on every run. There is no `DEBUG` line, because the root level is `INFO`. (Keep the `cfg` folder first. I ran the same command twice more on 11 November 2026, with Temurin 25.0.2, the same three jars and the same folder: with `cfg:` first it printed the lines above; with `:cfg` last it stopped at once with `java.lang.NoClassDefFoundError: ch/qos/logback/core/joran/spi/JoranException`, although that class is in `logback-core-1.6.6.jar`, which was on the class path both times. I did not find the cause; the observation is only that the order of the entries matters for this single-file `java L.java` run.)
 
 4. Run the same program without the configuration file:
 

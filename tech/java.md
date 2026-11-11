@@ -21,14 +21,14 @@ The repository is the hands-on project of Module 9 of a system design course. It
 
 | Path | What it does with Java |
 |---|---|
-| `src/main/java/io/plainround/seatwave/proxy/backend/` | 13 files: SeatWave itself. See `java-backend-walkthrough.md`. |
+| `src/main/java/io/plainround/seatwave/proxy/backend/` | 13 files: SeatWave itself. See `java-backend-walkthrough-1.md` and `java-backend-walkthrough-2.md`. |
 | `.../forwarded/` | 5 files: the client-address rule. See `java-forwarded-walkthrough.md`. |
 | `.../config/`, `.../json/`, `.../tls/` | 2, 1 and 1 files: the settings reader, the JSON codec and the TLS files. See `java-config-json-tls-walkthrough.md`. |
-| `.../bench/` | 11 files: the load generator. See `java-bench-walkthrough.md`. |
+| `.../bench/` | 11 files: the load generator. See `java-bench-walkthrough-1.md` and `java-bench-walkthrough-2.md`. |
 | `.../slow/` | 4 files: the slow clients. See `java-slow-clients-walkthrough.md`. |
 | `.../probe/` | 4 files: the outage probe. See `java-probe-walkthrough.md`. |
-| `.../report/` and `.../logs/` | 10 and 3 files: Module 5's report and the access-log reader. See `java-report-logs-walkthrough.md`. |
-| `src/test/java/io/plainround/seatwave/proxy/` | The tests, also Java (`tests-backend-walkthrough.md`, `tests-forwarded-config-tls-walkthrough.md`, `tests-tools-walkthrough.md`, `tests-stack-walkthrough.md`). |
+| `.../report/` and `.../logs/` | 10 and 3 files: Module 5's report and the access-log reader. See `java-report-logs-walkthrough-1.md` (report) and `java-report-logs-walkthrough-2.md` (logs). |
+| `src/test/java/io/plainround/seatwave/proxy/` | The tests, also Java (`tests-backend-walkthrough.md`, `tests-forwarded-config-tls-walkthrough.md`, `tests-tools-walkthrough-1.md`, `tests-tools-walkthrough-2.md`, `tests-stack-walkthrough.md`). |
 | `build.gradle.kts` | Tells Gradle to compile with Java 25 and to treat every warning as an error (`gradle.md`). |
 
 In all there are 54 source files under `src/main/java` (the counts above add up to 13 + 5 + 2 + 1 + 1 + 11 + 4 + 4 + 10 + 3 = 54). I ran `./gradlew -q compileJava` (it printed nothing, which means success) and found 93 class files under `build/classes/java/main/`. That is more than 54 because a nested class, a record or an enum inside a file gets its own class file.
@@ -76,6 +76,8 @@ public final class BackendServer implements AutoCloseable {
   private static final long SHUTDOWN_WAIT_SECONDS = 5;
   // sendResponseHeaders takes 0 for "length unknown", which makes the JDK server send chunks.
   private static final long CHUNKED = 0;
+  // ... and -1 for "no body at all", the answer to a HEAD request.
+  private static final long NO_BODY = -1;
   private static final int STREAM_OK = 200;
   private static final int ADMIN_OK = 200;
   private static final int ADMIN_NOT_FOUND = 404;
@@ -285,14 +287,12 @@ A `switch` **statement** with arrows does something in each arm and gives no val
     long bytes = 0;
     try (exchange) {
       Request request = request(exchange, scheme);
-      MDC.put("correlationId", request.correlationId());
       SeatWaveRoutes.Routed routed = routes.route(request);
       route = routed.route();
       switch (routed.reply()) {
         case Reply.Body body -> {
           status = body.status();
-          bytes = body.length();
-          writeBody(exchange, body, startNanos);
+          bytes = writeBody(exchange, body, startNanos);
         }
         case Reply.EventStream stream -> {
           status = STREAM_OK;
@@ -354,8 +354,17 @@ An `Optional<T>` is a box that holds a value or nothing. It makes "there may be 
     Hold owner =
         holdsBySeat.compute(
             seat,
-            (label, existing) ->
-                existing == null || !existing.isActiveAt(now) ? candidate : existing);
+            (label, existing) -> {
+              if (existing != null && existing.isActiveAt(now)) {
+                return existing;
+              }
+              if (existing != null) {
+                // The expired hold this one replaces is forgotten, so the table holds at most one
+                // hold per seat and cannot grow without end over a long run.
+                holdsById.remove(existing.holdId());
+              }
+              return candidate;
+            });
     if (owner != candidate) {
       return Optional.empty();
     }
@@ -363,12 +372,19 @@ An `Optional<T>` is a box that holds a value or nothing. It makes "there may be 
     return Optional.of(candidate);
   }
 
+  /**
+   * Finds a hold by its identifier: an active one, or an expired one whose seat nobody has held
+   * since.
+   *
+   * @return the hold, or empty once its seat has a newer hold
+   */
   Optional<Hold> find(String holdId) {
     return Optional.ofNullable(holdsById.get(holdId));
   }
 ```
 
-- `Optional<Hold> hold(...)` returns the new hold, or `Optional.empty()` when another customer holds the seat. `Optional.of(x)` wraps a value; `Optional.ofNullable(x)` wraps a value that may be `null`.
+- The lambda given to `compute` has a **block body**: `{ ... }` with `return` statements, used when one expression is not enough. It keeps a still-active hold, and otherwise removes the expired one from the second table before the new hold takes the seat.
+- `Optional<Hold> hold(...)` returns the new hold, or `Optional.empty()` when another customer holds the seat. `find` returns an `Optional` for the same reason: a hold that was never made, or one forgotten after its seat was held again, gives an empty box, never `null`. `Optional.of(x)` wraps a value; `Optional.ofNullable(x)` wraps a value that may be `null`.
 - The caller checks with `isPresent()` / `isEmpty()`, or takes the value out with `get()` after checking, `orElseThrow()`, or `orElse(...)`. In the tests, AssertJ's `assertThat(optional).hasValue(...)` checks one (`assertj.md`).
 
 A **stream** is a pipeline of steps over a collection: make a stream, change or filter its items, then collect the result.
@@ -442,13 +458,23 @@ This repository draws a line (`result4j.md`): a **bug** (a null argument, a reco
       properties.load(reader);
     } catch (NoSuchFileException missing) {
       throw new IOException("the settings file " + path + " does not exist", missing);
+    } catch (IllegalArgumentException malformed) {
+      // Properties.load refuses a broken escape (a backslash and a u with fewer than four hex
+      // digits) with this unchecked exception; a typo in a settings file is an expected failure,
+      // so it is reported like an unreadable file.
+      throw new IOException(
+          "the settings file "
+              + path
+              + " is not a valid properties file: "
+              + malformed.getMessage(),
+          malformed);
     }
     return properties;
   }
 ```
 
 - `throws IOException` in the signature tells callers they must handle it.
-- `try (Reader reader = ...) { ... } catch (NoSuchFileException missing) { ... }` is a try-with-resources (feature 10) with a `catch`. `NoSuchFileException` is a more specific kind of `IOException`; it is caught and **wrapped** in a new `IOException` that carries a clear message and, as a second argument, the original exception as the **cause**.
+- `try (Reader reader = ...) { ... } catch (NoSuchFileException missing) { ... } catch (IllegalArgumentException malformed) { ... }` is a try-with-resources (feature 10) with two `catch` blocks; Java tries them in order. `NoSuchFileException` is a more specific kind of `IOException`; it is caught and **wrapped** in a new `IOException` that carries a clear message and, as a second argument, the original exception as the **cause**. `IllegalArgumentException` is **unchecked** (the compiler does not make callers handle it); `Properties.load` throws it for a broken `\u` escape, and wrapping it in an `IOException` gives callers the one checked failure they already handle.
 
 `finally` is a block that runs after the `try` block whether it succeeded or threw. The handler quoted in feature 4 uses it to count a finished request and to clear the logging context, on every path.
 
@@ -491,7 +517,7 @@ A `Duration` is a length of time (`Duration.ofSeconds(300)`). An `Instant` is a 
 
 #### 14. Regular expressions
 
-A `Pattern` is a compiled regular expression. `pattern.matcher(text).matches()` is true if the **whole** text fits. The settings classes use patterns to say what a key may contain, for example `Pattern.compile("[A-Za-z0-9_./-]{1,200}")` for a file path: 1 to 200 characters from letters, digits and the signs `_ . / -`. `[abc]` means one of these characters; `{1,200}` means 1 to 200 times; `|` means "or"; `\\.` (in a Java string) is a literal dot.
+A `Pattern` is a compiled regular expression. `pattern.matcher(text).matches()` is true if the **whole** text fits. The settings classes use patterns to say what a key may contain, for example `Pattern.compile("[0-9.]{7,15}|[0-9a-fA-F:]{2,39}")` for an IP address in `BackendSettings`: 7 to 15 digits and dots, or 2 to 39 hexadecimal digits and colons. `[abc]` means one of these characters; `{7,15}` means 7 to 15 times; `|` means "or"; `[^abc]` means any character but these; `\\.` (in a Java string) is a literal dot.
 
 #### 15. Files and paths
 

@@ -8,7 +8,7 @@ JaCoCo works with a **Java agent**: a small jar that the Java Virtual Machine (J
 
 ## Why this repository uses it
 
-The build has a measured floor: line coverage must be at least 0.80, and the build fails below it. That keeps the tests honest as the code grows. The README reports "line coverage 91.8 percent (1,937 of 2,111 lines)" for 119 tests, and I measured the same numbers on 11 November 2026.
+The build has a measured floor: line coverage must be at least 0.80, and the build fails below it. That keeps the tests honest as the code grows. Version 1.0.0 had 119 tests and 91.8 percent (1,937 of 2,111 lines). For version 1.0.1 the final run had 166 tests and 95.5 percent (2,108 of 2,208 lines) on 11 November 2026; other runs of the same or almost the same code gave 2,104, 2,105 and 2,109, because a line or two run only when two threads meet in a certain order. The README states the number of its own run.
 
 ## Where it appears
 
@@ -55,7 +55,11 @@ tasks.test {
     dependsOn(testCertificates)
     systemProperty("seatwave.tls.directory", layout.buildDirectory.dir("tls").get().asFile.absolutePath)
     systemProperty("seatwave.nginx.directory", file("nginx").absolutePath)
+    // The configuration rules read these files too, so a change to any of them runs the tests again.
     inputs.dir("nginx")
+    inputs.dir("config")
+    inputs.file("compose.yaml")
+    inputs.file("Dockerfile")
     testLogging {
         events("passed", "failed", "skipped")
     }
@@ -95,41 +99,41 @@ tasks.check {
 }
 ```
 
-`counter = "LINE"` picks the line counter. `minimum = "0.80".toBigDecimal()` is the lowest accepted ratio of covered lines to all lines. The comment above it names the untested remainder: the command-line entry points. `tasks.check { dependsOn(...) }` makes the rule part of `check`. When I raised the minimum to 0.95 in a scratch copy, the build failed with `Rule violated for bundle seatwave-proxy: lines covered ratio is 0.91, but expected minimum is 0.95`.
+`counter = "LINE"` picks the line counter. `minimum = "0.80".toBigDecimal()` is the lowest accepted ratio of covered lines to all lines. The comment above it names the untested remainder: the command-line entry points. `tasks.check { dependsOn(...) }` makes the rule part of `check`. When I raised the minimum to 0.96 in a scratch copy, the build failed with `Rule violated for bundle seatwave-proxy: lines covered ratio is 0.95, but expected minimum is 0.96`.
 
-### The real numbers (Temurin 25.0.2, 119 tests)
+### The real numbers (Temurin 25.0.2, 166 tests)
 
-I ran `./gradlew clean check` in a scratch copy and read `build/reports/jacoco/test/jacocoTestReport.xml` and the HTML report. The last row of the HTML table, "Total", reads:
+I ran `./gradlew clean check` in a scratch copy of version 1.0.1 and read `build/reports/jacoco/test/jacocoTestReport.xml` and the HTML report. The last row of the HTML table, "Total", reads:
 
 | Counter | Missed | Total | Covered |
 | --- | --- | --- | --- |
-| Instructions | 726 | 10,820 | 93 percent (10,094 covered) |
-| Branches | 112 | 748 | 85 percent (636 covered) |
-| Lines | 174 | 2,111 | 1,937 lines, 91.8 percent |
-| Methods | 12 | 336 | 324 |
+| Instructions | 421 | 11,280 | 96 percent (10,859 covered) |
+| Branches | 99 | 814 | 87 percent (715 covered) |
+| Lines | 100 | 2,208 | 2,108 lines, 95.5 percent |
+| Methods | 8 | 351 | 343 |
 | Classes | 0 | 89 | 89 |
-| Complexity | 116 | 716 | 600 |
+| Complexity | 105 | 764 | 659 |
 
-The rule needs 0.80 of 2,111 lines, which is 1,688.8, so at least 1,689 covered lines. The build has 1,937. **The margin is 248 lines.**
+The rule needs 0.80 of 2,208 lines, which is 1,766.4, so at least 1,767 covered lines. The build has 2,108. **The margin is 341 lines.**
 
 Per package, the missed lines (from the XML report, class by class):
 
 | Package | Missed lines | Total lines | Where |
 | --- | --- | --- | --- |
-| `backend` | 41 | 745 | `SeatWaveRoutes` 16, `BackendCli` 13 (its `main`, lines 31 to 45), `BackendServer` 7, `StaticFiles` 3, `HoldKeys` 1, `BackendMetrics` 1. |
-| `bench` | 37 | 379 | `BenchCli` 14, `LoadRun` 10, `ContainerCounters` 5, `LoadRun$Tally` 3, and one each in `BenchSettings`, `BenchReport`, `BenchRow`, `LoadResult` and `RawResponse`. |
-| `slow` | 28 | 219 | `SlowClients` 21, `SlowClientsCli` 7. |
-| `probe` | 28 | 138 | `ProbeCli` 26, `ProbeSettings` 2. |
-| `json` | 22 | 54 | `JsonCodec` 22: the refusal branches of `read` (see below). |
-| `report` | 6 | 251 | `ReportCli` 4, `Runs` 1, `CurlProblem` 1. |
+| `backend` | 29 | 770 | `BackendCli` 13 (its `main`, lines 31 to 45), `BackendServer` 9, `SeatWaveRoutes` 3, `StaticFiles` 3, `HoldKeys` 1. |
+| `slow` | 23 | 228 | `SlowClients` 20, `SlowClientsCli` 3. |
+| `bench` | 19 | 401 | `LoadRun` 8, `ContainerCounters` 5, `BenchCli` 3, and one each in `BenchSettings`, `LoadResult` and `RawResponse`. |
+| `probe` | 9 | 148 | `ProbeCli` 7, `ProbeSettings` 2. |
+| `json` | 6 | 63 | `JsonCodec` 6. |
 | `logs` | 5 | 101 | `LogStats` 2, `LogStatsCli` 3. |
-| `tls` | 4 | 38 | `TlsFiles` 4. |
-| `config` | 3 | 68 | `SettingsFiles` 3. |
-| `forwarded` | 0 | 118 | Every line ran. |
+| `tls` | 4 | 42 | `TlsFiles` 4. |
+| `report` | 4 | 251 | `ReportCli` 2, `Runs` 1, `CurlLine` 1. |
+| `forwarded` | 1 | 131 | `ClientAddress` 1. |
+| `config` | 0 | 73 | Every line ran. |
 
-The six classes that hold a `main` method are `BackendCli`, `BenchCli`, `LogStatsCli`, `ProbeCli`, `ReportCli` and `SlowClientsCli`. Their missed lines add up to 67 of the 174 (13 + 14 + 3 + 26 + 4 + 7), and the build file's comment on the rule names them: "the command-line entry points are the untested remainder". Most of those classes also have a `run` or `start` method that the tests call directly for the bad-usage and bad-file paths; the lines that run a real measurement against the stack, and the one-line `main`, are not reached. The `Classes` row shows 0 missed of 89: every class ran at least in part.
+The six classes that hold a `main` method are `BackendCli`, `BenchCli`, `LogStatsCli`, `ProbeCli`, `ReportCli` and `SlowClientsCli`. Their missed lines add up to 31 of the 100 (13 + 3 + 3 + 7 + 2 + 3), and the build file's comment on the rule names them: "the command-line entry points are the untested remainder". Each of those classes has a `run`, `start`, `bench`, `probeAndPrint` or `runAndPrint` method that the tests call directly, so in version 1.0.1 a whole successful run of the bench, the probe and the slow clients is tested; what stays unrun is mostly the one-line `main` and the paths that only a real stack, a stalled server or a broken runtime reach. The `Classes` row shows 0 missed of 89: every class ran at least in part.
 
-`JsonCodec` is different. Its 22 missed lines (lines 74 to 103 and 117 to 129 of the source) are the branches that refuse a bad request body: an empty body, a body that is not an object, data after the object, an unknown field, a wrong type, a number out of range and malformed JSON. I read the XML and the source to confirm it: the one success path of `read` ran, and each `return Result.error(...)` and each `catch` did not. The other missed lines are mostly error paths too, for example in `SlowClients` and `SeatWaveRoutes`; I did not read all of them one by one.
+`JsonCodec`'s 6 missed lines are fallbacks no request body reaches: a binding failure that is neither a wrong type nor a number out of range, a Jackson failure that is neither a reading nor a binding failure, the `IOException` that cannot happen when reading a `String`, and the branch for a list index inside a JSON pointer (the request records have no lists). The first version left 22 lines of `JsonCodec` red, all its refusals; `JsonCodecTest` now runs each. `HoldKeys` has the branch where a thread loses the race of `putIfAbsent`: `HoldKeysTest` races 100 threads for one key, and in this run no thread happened to lose at that exact moment, so the line did not run; in the 40-run loop's last run one did. Whether the line runs depends on how the threads meet, which is why two runs can differ by a line.
 
 ### Reading the report
 
@@ -145,7 +149,7 @@ All commands ran in a scratch copy on 11 November 2026. Timings differ on every 
 ./gradlew clean check
 ```
 
-   Expected: 119 `PASSED` lines (with `--console=plain`), `> Task :jacocoTestCoverageVerification`, `BUILD SUCCESSFUL in 10s` and `10 actionable tasks: 10 executed`.
+   Expected: 166 `PASSED` lines (with `--console=plain`), `> Task :jacocoTestCoverageVerification`, `BUILD SUCCESSFUL in 15s` and `10 actionable tasks: 10 executed`.
 
 2. Print the totals from the HTML report:
 
@@ -153,7 +157,7 @@ All commands ran in a scratch copy on 11 November 2026. Timings differ on every 
 grep -o '<tfoot>.*</tfoot>' build/reports/jacoco/test/html/index.html | sed 's/<[^>]*>/ /g'
 ```
 
-   Expected: `Total  726 of 10,820  93%  112 of 748  85%  116  716  174  2,111  12  336  0  89`.
+   Expected: `Total  427 of 11,280  96%  99 of 814  87%  105  764  104  2,208  8  351  0  89`.
 
 3. Print the total line counter from the XML report:
 
@@ -161,7 +165,7 @@ grep -o '<tfoot>.*</tfoot>' build/reports/jacoco/test/html/index.html | sed 's/<
 grep -o '<counter type="LINE"[^>]*>' build/reports/jacoco/test/jacocoTestReport.xml | tail -1
 ```
 
-   Expected: `<counter type="LINE" missed="174" covered="1937"/>`.
+   Expected: `<counter type="LINE" missed="104" covered="2104"/>`.
 
 4. Print the totals of the `probe` package:
 
@@ -169,7 +173,7 @@ grep -o '<counter type="LINE"[^>]*>' build/reports/jacoco/test/jacocoTestReport.
 grep -o '<tfoot>.*</tfoot>' build/reports/jacoco/test/html/io.plainround.seatwave.proxy.probe/index.html | sed 's/<[^>]*>/ /g'
 ```
 
-   Expected: `Total  92 of 631  85%  5 of 42  88%  6  42  28  138  1  21  0  5`. The `probe` package has 138 lines, 28 of them missed, and no missed class.
+   Expected: `Total  46 of 688  93%  7 of 50  86%  8  50  13  148  1  25  0  5`. The `probe` package has 148 lines, 13 of them missed, and no missed class.
 
 5. See the recording and the report folders:
 
@@ -187,17 +191,17 @@ ls build/jacoco build/reports/jacoco/test build/reports/jacoco/test/html
 - **Chasing 100 percent for `main` methods.** The build documents them as the untested remainder instead.
 - **Running only `./gradlew test` and expecting the rule to be checked.** The rule runs in `jacocoTestCoverageVerification`, which `check` runs.
 - **Reading an old report.** The report is rewritten after each `test` run; run the tests first.
-- **Forgetting the margin.** There are 248 lines of headroom now, but every untested line uses some of it, so new code still needs tests in the same change.
+- **Forgetting the margin.** There are 337 lines of headroom now, but every untested line uses some of it, so new code still needs tests in the same change.
 - **Deleting a test to make a number look right.** The check then fails for the right reason.
-- **Reading a high total as proof that every rule is tested.** A whole package can hide behind it: here the refusal branches of `JsonCodec` are red while the project total is 91.8 percent.
+- **Reading a high total as proof that every rule is tested.** A whole package can hide behind it: in version 1.0.0 every refusal branch of `JsonCodec` was red while the project total was 91.8 percent.
 
 ## Check yourself
 
 1. *What does the line counter measure?* The share of source lines in which at least one instruction ran during the tests.
 2. *Which task checks the rule and which writes the reports?* `jacocoTestCoverageVerification` checks; `jacocoTestReport` writes the HTML and the XML.
-3. *Why is coverage 91.8 percent and not 100?* The `main` methods of the command-line classes are never called by a test (67 of the 174 missed lines), and the rest are error paths that a test would have to break something on purpose to reach.
+3. *Why is coverage 95.5 percent and not 100?* The `main` methods of the command-line classes are never called by a test (most of the 31 missed lines of those classes), and the rest are error paths that a test would have to break something on purpose to reach, such as a runtime without SHA-256.
 4. *What makes the rule part of `check`?* `tasks.check { dependsOn(tasks.jacocoTestCoverageVerification) }`.
-5. *How many lines of headroom are there?* 248: 1,937 covered against 1,689 required.
+5. *How many lines of headroom are there?* 341: 2,108 covered against 1,767 required.
 
 ## Further reading
 

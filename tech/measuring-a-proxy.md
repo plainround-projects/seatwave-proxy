@@ -134,7 +134,7 @@ A single run can be unlucky: the computer was busy, the Java program was still c
 - **Take the median run**: not the mean of three, but the middle run itself, with all its own numbers (`BenchReport.median`). The numbers in a row then belong together.
 - **Show the spread**: the line under each row lists all three throughputs. In the README, `direct-http` ran 4555, 4491 and 4614 requests per second. That is a spread of about 2.7 percent. A difference between two scenarios smaller than the spread is not a result.
 
-Look at the README's `proxy-no-reuse` row for what a bad spread looks like: runs of 957, 299 and 4 requests per second, 3,330 errors in the median run. The median (299) is a real run, but the row says the scenario is unstable, not that it is 299. The tool does not explain this; it only shows it. The row's CPU cost per thousand (3328 ms) is also inflated: see the next section.
+Look at the README's first `proxy-no-reuse` row, measured with version 1.0.0, for what a bad spread looks like: runs of 957, 299 and 4 requests per second, 3,330 errors in the median run. The median (299) is a real run, but the row says the scenario is unstable, not that it is 299. Version 1.0.0 showed that row like any other. Since 1.0.1 the bench prints a **warning line** under a row whose median run had more than 1 percent failed requests, or whose fastest run was more than twice its slowest (`BenchReport.warnings`), so an unsteady row can no longer pass as a steady rate. The README shows the row measured again with the fixed bench.
 
 ### 7. Cost: processor time and connections
 
@@ -143,11 +143,14 @@ Throughput says how fast; cost says how expensive. The bench reads two files ins
 - `/sys/fs/cgroup/cpu.stat`, line `usage_usec`: the processor time all processes of the container have used, in microseconds. A **control group** (cgroup) is the Linux kernel's way to count what a group of processes uses.
 - `/proc/net/snmp`, the `Tcp:` lines: `ActiveOpens` (connections the container opened) and `PassiveOpens` (connections it accepted).
 
-The difference between the two readings is what the run cost. The table divides processor time by the number of successful requests, in milliseconds per thousand requests (`CPU ms/1k`):
+The difference between the two readings is what the run cost. The table divides processor time by the number of requests sent, successful or failed, in milliseconds per thousand requests (`CPU ms/1k`):
 
 ```java
   private double perThousand(double amount) {
-    return result.requests() == 0 ? 0 : amount * PER_THOUSAND / result.requests();
+    // Every request sent, successful or not: a container spends CPU on a failed request too, so
+    // dividing by the successes alone would charge the failures' CPU to them.
+    long sent = Math.addExact(result.requests(), result.errors());
+    return sent == 0 ? 0 : amount * PER_THOUSAND / sent;
   }
 }
 ```
@@ -160,7 +163,9 @@ Read the README with it.
 - **Compression.** `gzip-1` sends 2,453 bytes for a 36,894-byte seat map (93 percent fewer) at 99.5 ms per thousand. `gzip-9` sends 2,351 bytes (4 percent fewer than level 1) at 601.7 ms per thousand, six times the cost, and handles 1,656 requests per second against 6,670. More effort bought almost nothing.
 - **The cache.** `poster-direct`: SeatWave spends 580.2 ms per thousand to send a 300 KB file. `poster-cached` (100 percent cache hits): SeatWave 0.4, the proxy 355.5.
 
-Two cautions. First, processor time is divided by **successful** requests, but it counts the work for failed ones too. When a scenario has errors (`proxy-no-reuse`: 2,991 good requests, 3,330 errors), the cost per good request is overstated. Check the `errors` column first. Second, the readings are taken by running `cat` inside the container, which adds a little processor time to the counter; the amount is small against a 10-second run, but it is not zero.
+`Math.addExact` adds the two counts and fails loudly instead of wrapping around if the sum were ever too large for a `long`. The comment gives the reason for the change: the container's processor time includes the work it did for failed requests, so it must be divided by every request, not only by the successful ones. Version 1.0.0 divided by the successes, and its `proxy-no-reuse` row (2,991 good requests, 3,330 errors) showed 3328.0 ms per thousand, more than twice the real cost per request sent.
+
+Two cautions. First, a cost per request sent is still not a cost per useful answer: when a scenario has errors, check the `errors` column and the warning line first. Second, the readings are taken by running `cat` inside the container, which adds a little processor time to the counter; the amount is small against a 10-second run, but it is not zero.
 
 ### 8. Operators' numbers: the access log
 
@@ -180,7 +185,7 @@ While this goes on, one fast probe asks for `/health`. Its latency is what a nor
 
 ### 10. Outages
 
-The **outage probe** sends one request every 100 ms on a schedule and records how each ended. The result is a list of spans. The outage is the time from the first failed request to the first success after the last. The README's runs: stopping the proxy for 10 s gave `connection lost` x 2, then `connection refused` x 103, then 200s again: outage 10.502 s. Stopping SeatWave gave `request timeout` x 11 (about 1 s each, the probe's timeout) and an outage of 11.032 s. Reloading NGINX's configuration twice during a probe gave no outage: 300 requests, all 200.
+The **outage probe** sends one request every 100 ms on a schedule and records how each ended. The result is a list of spans. The outage is the time from the first failed request to the first success after the last. The README's runs of version 1.0.0: stopping the proxy for 10 s gave `connection lost` x 2, then `connection refused` x 103, then 200s again: outage 10.502 s. Stopping SeatWave gave `request timeout` x 11 (about 1 s each, the probe's timeout) and an outage of 11.032 s. Reloading NGINX's configuration twice during a probe gave no outage: 300 requests, all 200.
 
 How a failure looks matters. A refused connection is instant (the operating system answers at once). A timeout takes as long as the timeout. A user and a retry rule experience them differently.
 

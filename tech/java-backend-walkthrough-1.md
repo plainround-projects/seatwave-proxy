@@ -204,8 +204,17 @@ The constructor stores the clock. `this.clock` is the field; `clock` on the righ
     Hold owner =
         holdsBySeat.compute(
             seat,
-            (label, existing) ->
-                existing == null || !existing.isActiveAt(now) ? candidate : existing);
+            (label, existing) -> {
+              if (existing != null && existing.isActiveAt(now)) {
+                return existing;
+              }
+              if (existing != null) {
+                // The expired hold this one replaces is forgotten, so the table holds at most one
+                // hold per seat and cannot grow without end over a long run.
+                holdsById.remove(existing.holdId());
+              }
+              return candidate;
+            });
 ```
 
 This is the heart of the file. `compute(seat, function)` calls the function with the seat label and the current value for that seat (`existing`, or `null` if none). The function returns the new value to store. The `->` is a **lambda**: a small unnamed function written inline. The function says: if there is no hold, or the existing hold has expired, store the candidate; otherwise keep the existing hold. `compute` runs this for one key atomically, so two threads asking for the same seat run one after the other, never together. The result `owner` is whatever is stored after the call.
@@ -219,10 +228,18 @@ This is the heart of the file. `compute(seat, function)` calls the function with
   }
 ```
 
-`owner != candidate` compares the two objects by identity (are they the very same object?). If the stored hold is not our candidate, somebody else holds the seat, and the method returns `Optional.empty()`. Otherwise the candidate won: it is also written into `holdsById`, and returned inside an `Optional`. An expired hold stays in `holdsById` forever; a note at the end of this file lists that as a limit of this lab.
+`owner != candidate` compares the two objects by identity (are they the very same object?). If the stored hold is not our candidate, somebody else holds the seat, and the method returns `Optional.empty()`. Otherwise the candidate won: it is also written into `holdsById`, and returned inside an `Optional`.
+
+The function given to `compute` now has a body in braces with `return` statements. It keeps an active hold. Otherwise, if an expired hold is in the way, it removes that hold from `holdsById` before the candidate takes the seat. The comment says why: in the first version an expired hold stayed in `holdsById` forever, so the table grew with every hold over a long run. Now `holdsById` keeps at most one hold per seat (the newest), which bounds it at the 20,000 seats of the event. Removing from the other map inside `compute` is safe: `compute` forbids changing its own map from the function, not another one.
 
 ```java
 
+  /**
+   * Finds a hold by its identifier: an active one, or an expired one whose seat nobody has held
+   * since.
+   *
+   * @return the hold, or empty once its seat has a newer hold
+   */
   Optional<Hold> find(String holdId) {
     return Optional.ofNullable(holdsById.get(holdId));
   }
@@ -238,7 +255,7 @@ This is the heart of the file. `compute(seat, function)` calls the function with
 }
 ```
 
-`find` looks a hold up by identifier; `Optional.ofNullable` turns a missing value (`null`) into `Optional.empty()`. `now()` hands the clock's time to the routes, so they and the ledger use the same clock. `isHeld` says whether a seat is held right now: a hold exists and it is still active. The seat page uses it to write `held` or `available`.
+`find` looks a hold up by identifier; `Optional.ofNullable` turns a missing value (`null`) into `Optional.empty()`. Its Javadoc states what it can find: an active hold, or an expired one whose seat nobody has held since (`GET /v1/holds/{id}` then shows `"state":"expired"`). Once a newer hold takes the seat, the old identifier is no longer known, and the route answers 404. `now()` hands the clock's time to the routes, so they and the ledger use the same clock. `isHeld` says whether a seat is held right now: a hold exists and it is still active. The seat page uses it to write `held` or `available`.
 
 ### `backend/HoldKeys.java`
 
@@ -1059,7 +1076,6 @@ The record has twelve components. `InetAddress` is an IP address; `Path` is a fi
 ```java
   // An IP address literal; a host name would need DNS before the server could start.
   private static final Pattern ADDRESS = Pattern.compile("[0-9.]{7,15}|[0-9a-fA-F:]{2,39}");
-  private static final Pattern FILE = Pattern.compile("[A-Za-z0-9_./-]{1,200}");
   private static final int HIGHEST_PORT = 65_535;
   private static final int MAX_WORKERS = 1_024;
   // Linux caps a listen backlog at net.core.somaxconn, 4,096 in the lab's containers.
@@ -1068,7 +1084,7 @@ The record has twelve components. `InetAddress` is an IP address; `Path` is a fi
   private static final int MAX_WAIT_MILLIS = 600_000;
 ```
 
-Constants. `ADDRESS` allows either an IPv4 shape (digits and dots, 7 to 15 characters) or an IPv6 shape (hex digits and colons). The comment says why: a host name would need a DNS lookup before the server could start. `FILE` allows letters, digits, `_`, `.`, `/` and `-` up to 200 characters: no spaces and no other symbols. The others are the highest port (65,535) and the highest allowed values for workers (1,024), backlog (65,535, the comment notes the operating system's own cap), queue (100,000) and wait times (600,000 ms). Note that `FILE` limits the length of a keystore path to 200 characters; a long absolute path breaks start-up with a clear message (see "Mistakes people make").
+Constants. `ADDRESS` allows either an IPv4 shape (digits and dots, 7 to 15 characters) or an IPv6 shape (hex digits and colons). The comment says why: a host name would need a DNS lookup before the server could start. There is no file pattern here any more: the two file paths are read with the reader's own `filePath` rule. The others are the highest port (65,535) and the highest allowed values for workers (1,024), backlog (65,535, the comment notes the operating system's own cap), queue (100,000) and wait times (600,000 ms).
 
 ```java
   /**
@@ -1109,32 +1125,36 @@ The compact constructor refuses `null` for the five object fields and then calls
     int plainPort = reader.intBetween("http.plainPort", 0, HIGHEST_PORT);
     int tlsPort = reader.intBetween("http.tlsPort", 0, HIGHEST_PORT);
     int adminPort = reader.intBetween("http.adminPort", 0, HIGHEST_PORT);
-    String keystore = reader.textMatching("tls.keystore", FILE);
-    String passwordFile = reader.textMatching("tls.passwordFile", FILE);
+    String keystore = reader.filePath("tls.keystore");
+    String passwordFile = reader.filePath("tls.passwordFile");
     int backlog = reader.intBetween("http.backlog", 1, MAX_BACKLOG);
     int workers = reader.intBetween("http.workerThreads", 1, MAX_WORKERS);
     int queue = reader.intBetween("http.queueCapacity", 1, MAX_QUEUE);
     List<String> trusted = reader.listMatching("forwarded.trustedProxies", ADDRESS);
     Duration longPoll = reader.millisBetween("feed.longPollHoldMillis", 1, MAX_WAIT_MILLIS);
+    int problemsBeforeStream = reader.problems().size();
     Duration heartbeat = reader.millisBetween("feed.heartbeatMillis", 1, MAX_WAIT_MILLIS);
     Duration lifetime = reader.millisBetween("feed.streamLifetimeMillis", 1, MAX_WAIT_MILLIS);
+    // The rule between the two keys is checked only when both were read, so a missing key gives
+    // one problem line, not a second one about the stand-in values.
+    boolean streamKeysValid = reader.problems().size() == problemsBeforeStream;
 ```
 
-Each line reads one key with its rule. `reader.intBetween("http.plainPort", 0, 65535)` reads a whole number from 0 to 65,535 (0 means "any free port"). `textMatching` checks a text against a pattern. `listMatching` reads a comma-separated list. `millisBetween` reads a number of milliseconds and returns a `Duration`. If a key is missing or wrong, the reader records a problem and returns a harmless stand-in value, so the code can keep going and find more problems.
+Each line reads one key with its rule. `reader.intBetween("http.plainPort", 0, 65535)` reads a whole number from 0 to 65,535 (0 means "any free port"). `textMatching` checks a text against a pattern, and `filePath` checks a file path (any characters but control characters, up to 4,096; `java-config-json-tls-walkthrough.md`). `listMatching` reads a comma-separated list. `millisBetween` reads a number of milliseconds and returns a `Duration`. If a key is missing or wrong, the reader records a problem and returns a harmless stand-in value, so the code can keep going and find more problems. `problemsBeforeStream` remembers how many problems there were before the two stream keys were read, and `streamKeysValid` is true only if reading them added none. The comment says why: the rule between the two keys (below) must not run on stand-in values. With both keys missing, both stand-ins are 1 ms, and the first version then added a third, false line saying the lifetime must be longer than the heartbeat.
 
 ```java
     if (sharePort(plainPort, tlsPort, adminPort)) {
       reader.addProblem(
           "http.plainPort, http.tlsPort and http.adminPort must differ (0 means any free port)");
     }
-    if (lifetime.compareTo(heartbeat) <= 0) {
+    if (streamKeysValid && lifetime.compareTo(heartbeat) <= 0) {
       reader.addProblem(
           "feed.streamLifetimeMillis must be longer than feed.heartbeatMillis, or a stream ends"
               + " before its first heartbeat");
     }
 ```
 
-Two rules between keys, checked after the individual keys: the three ports must differ (unless they are 0), and the stream lifetime must be longer than the heartbeat, otherwise the stream would end before its first heartbeat. `reader.addProblem` adds a line to the same list.
+Two rules between keys, checked after the individual keys: the three ports must differ (unless they are 0), and the stream lifetime must be longer than the heartbeat, otherwise the stream would end before its first heartbeat. The second runs only when `streamKeysValid`. `reader.addProblem` adds a line to the same list.
 
 ```java
     Optional<InetAddress> address = bind.isEmpty() ? Optional.empty() : literal(reader, bind);
@@ -1298,9 +1318,9 @@ They pass. `tests-backend-walkthrough.md` explains them.
 - **Check then write as two steps.** "If the seat is free, hold it" as a read followed by a write lets two threads both win. `HoldLedger` uses `compute`, and `HoldKeys` uses `putIfAbsent`, each as one step.
 - **Mutable values shared between threads.** An array in a record can be changed by whoever kept it. `Reply.Body`, `Request` and `StaticFile` copy their arrays in and out.
 - **Believing a header sent twice.** `Request.header` returns nothing if the header appeared more than once.
-- **Unbounded tables.** A table keyed by something the client chooses must have a limit. `HoldKeys.MAX_KEYS` is 100,000. The ledger is bounded only by the 20,000 seat labels, but its second table (`holdsById`) keeps expired holds for the life of the process; that is fine for a lab and wrong for production.
+- **Unbounded tables.** A table keyed by something the client chooses must have a limit. `HoldKeys.MAX_KEYS` is 100,000. The ledger is bounded by the 20,000 seat labels: both of its tables hold at most one hold per seat, because a new hold removes the expired one it replaces. (The first version kept every expired hold in `holdsById` for the life of the process.)
 - **Storing the error with the key.** This server stores every final answer for an Idempotency-Key, including a 400 or a 409. A client that fixes its body must use a new key, or it receives 422 "key reused".
-- **A long file path in the settings.** `FILE` allows 200 characters. A keystore path longer than that is refused at start-up. This makes `BackendCliTest.startsAndPrintsItsListenersFromAValidFile` fail when the repository is cloned into a deep folder (see `tests-backend-walkthrough.md`).
+- **A settings rule stricter than the thing it describes.** The first version allowed a file path only 200 characters of letters, digits, `_`, `.`, `/` and `-`. Real paths hold spaces and `+`, and a checkout can sit deep in folders, so `BackendCliTest.startsAndPrintsItsListenersFromAValidFile` failed in such a checkout. The rule now allows what a real path may hold (`SettingsReader.filePath`).
 
 ## Check yourself
 
