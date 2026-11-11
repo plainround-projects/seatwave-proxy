@@ -1,0 +1,127 @@
+# SeatWave behind its reverse proxy (Module 9). Start and stop it with scripts/stack.sh, which
+# uses the project name seatwave-proxy and brings everything down with "down -v".
+# Images are pinned by tag and digest, checked on Docker Hub on 11 November 2026: nginx:1.30.6
+# (the stable line, Debian trixie, built with OpenSSL 3.5.7) and SeatWave's own image, built by the
+# Dockerfile from two pinned images. Every port is published on 127.0.0.1 only, from Module 9's
+# range 20900 to 20999. Nothing runs privileged, nothing uses the host network or the Docker
+# socket, and the only folders mounted are this project's nginx/ and build/tls, read-only.
+name: seatwave-proxy
+
+x-nginx-image: &nginx-image nginx:1.30.6@sha256:42c68eab6f7e22611786a9fe1d1c019e275c50185bd54b8f75dc2b9184322703
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+
+services:
+  backend:
+    <<: *hardening
+    build: .
+    image: seatwave-proxy-backend:1.0.0
+    cap_drop:
+      - ALL
+    # Module 1's reference machine has 4 vCPU; SeatWave gets 4 CPUs of the Docker virtual machine.
+    cpus: 4
+    mem_limit: 1g
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./build/tls:/run/tls:ro
+    networks:
+      lab:
+        ipv4_address: 10.209.9.20
+    ports:
+      - "127.0.0.1:20910:8443"
+      - "127.0.0.1:20911:8080"
+      - "127.0.0.1:20912:8081"
+
+  # The sidecar shares SeatWave's network namespace, as a second container in one pod would.
+  sidecar:
+    <<: *hardening
+    image: *nginx-image
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    network_mode: "service:backend"
+    depends_on:
+      - backend
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    cpus: 1
+    mem_limit: 128m
+    tmpfs:
+      - /var/cache/nginx:size=32m
+      - /run:size=1m
+    volumes:
+      - ./nginx/sidecar/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./build/tls:/etc/nginx/tls:ro
+
+  proxy:
+    <<: *hardening
+    image: *nginx-image
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    depends_on:
+      - backend
+      - sidecar
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    # One CPU, and one worker process in nginx.conf: every proxy number is per core. The memory
+    # limit covers the tmpfs folders too (their pages count against it): the cache and the
+    # temporary files of buffered responses, and the access log of a whole bench run.
+    cpus: 1
+    mem_limit: 1g
+    tmpfs:
+      - /var/cache/nginx:size=300m
+      - /var/log/nginx/seatwave:size=600m
+      - /run:size=1m
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/seatwave:/etc/nginx/seatwave:ro
+      - ./build/tls:/etc/nginx/tls:ro
+    networks:
+      lab:
+        ipv4_address: 10.209.9.10
+    ports:
+      - "127.0.0.1:20900:8443"
+      - "127.0.0.1:20901:8444"
+      - "127.0.0.1:20902:8080"
+      - "127.0.0.1:20903:8081"
+      - "127.0.0.1:20904:8445"
+      - "127.0.0.1:20905:8446"
+      - "127.0.0.1:20906:8447"
+      - "127.0.0.1:20907:8451"
+      - "127.0.0.1:20908:8456"
+      - "127.0.0.1:20909:8459"
+      - "127.0.0.1:20914:8460"
+      - "127.0.0.1:20920:8090"
+
+  # Runs the slow-client lab inside the lab network: docker compose run --rm tools <settings>.
+  # Only started on demand (profile "tools"); it publishes no port.
+  tools:
+    <<: *hardening
+    image: seatwave-proxy-backend:1.0.0
+    profiles:
+      - tools
+    entrypoint: ["/opt/seatwave-java/bin/java", "-cp", "/app/lib/*", "io.plainround.seatwave.proxy.slow.SlowClientsCli"]
+    cap_drop:
+      - ALL
+    cpus: 2
+    mem_limit: 512m
+    tmpfs:
+      - /tmp
+    networks:
+      lab:
+        ipv4_address: 10.209.9.30
+
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 10.209.9.0/24

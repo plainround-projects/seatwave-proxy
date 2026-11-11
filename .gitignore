@@ -1,0 +1,15 @@
+.gradle/
+build/
+out/
+*.log
+.DS_Store
+.idea/
+*.iml
+.env
+# Test certificates and their keys are generated into build/tls on every machine and never committed.
+*.p12
+*.jks
+*.pem
+*.key
+*.crt
+*.password

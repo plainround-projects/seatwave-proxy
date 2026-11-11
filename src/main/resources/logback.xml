@@ -1,0 +1,14 @@
+<configuration>
+  <!-- One line per business event with its correlation id: NGINX's $request_id when the request
+       came through the trusted proxy, so a proxy log line and a SeatWave log line can be joined. -->
+  <!-- Log lines go to standard error, so a tool's report on standard output stays clean. -->
+  <appender name="console" class="ch.qos.logback.core.ConsoleAppender">
+    <target>System.err</target>
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level [%X{correlationId:-none}] %logger{0} - %msg%n</pattern>
+    </encoder>
+  </appender>
+  <root level="INFO">
+    <appender-ref ref="console"/>
+  </root>
+</configuration>

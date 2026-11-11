@@ -1,0 +1,10 @@
+# Module 9's before and after, with Module 5's curl -w method: name, URL, CA file, optional gzip.
+# Before (SIMPLE): clients straight to SeatWave on its own ports.
+direct-https    https://127.0.0.1:20910/events/1/seats?section=A  build/tls/seatwave-test-ca.pem
+direct-http     http://127.0.0.1:20911/events/1/seats?section=A
+# After: the same request through the proxy, one feature at a time, then PRODUCTION.
+proxy-http      http://127.0.0.1:20902/events/1/seats?section=A
+proxy-tls       https://127.0.0.1:20901/events/1/seats?section=A  build/tls/seatwave-test-ca.pem
+proxy-no-reuse  https://127.0.0.1:20904/events/1/seats?section=A  build/tls/seatwave-test-ca.pem
+proxy-sidecar   https://127.0.0.1:20906/events/1/seats?section=A  build/tls/seatwave-test-ca.pem
+production      https://127.0.0.1:20900/events/1/seats?section=A  build/tls/seatwave-test-ca.pem  gzip
