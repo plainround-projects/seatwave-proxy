@@ -30,8 +30,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Every reply says how it may be cached, because the proxy obeys it: static files are {@code
  * public, max-age=300}; a hold is {@code private}, so no shared cache may keep it; seat maps and
- * events are {@code no-cache}; writes and errors are {@code no-store}. Thread-safe: the ledger, the
- * key table and the metrics are, and nothing else changes after construction.
+ * events are {@code no-cache}; writes and errors are {@code no-store}. Thread-safe: the ledger and
+ * the key table are, and nothing else changes after construction.
  */
 final class SeatWaveRoutes {
 
@@ -74,19 +74,16 @@ final class SeatWaveRoutes {
   private final SeatCatalog catalog;
   private final HoldKeys keys;
   private final StaticFiles staticFiles;
-  private final BackendMetrics metrics;
   private final BackendSettings.Timing timing;
   private final JsonCodec json;
   private final Problems problems;
 
-  SeatWaveRoutes(
-      HoldLedger ledger, BackendMetrics metrics, BackendSettings.Timing timing, JsonCodec json) {
+  SeatWaveRoutes(HoldLedger ledger, HoldKeys keys, BackendSettings.Timing timing, JsonCodec json) {
     this.ledger = Objects.requireNonNull(ledger, "ledger");
-    this.metrics = Objects.requireNonNull(metrics, "metrics");
+    this.keys = Objects.requireNonNull(keys, "keys");
     this.timing = Objects.requireNonNull(timing, "timing");
     this.json = Objects.requireNonNull(json, "json");
     this.catalog = new SeatCatalog(ledger);
-    this.keys = new HoldKeys();
     this.staticFiles = new StaticFiles();
     this.problems = new Problems(json);
   }
@@ -99,13 +96,20 @@ final class SeatWaveRoutes {
    */
   Routed route(Request request) {
     String path = request.path();
-    if (request.method().equals("POST")) {
-      return path.equals("/v1/holds")
+    String method = request.method();
+    if (path.equals("/v1/holds")) {
+      return method.equals("POST")
           ? new Routed("POST /v1/holds", hold(request))
-          : new Routed("other", notAllowed(request, "GET"));
+          : new Routed("other", notAllowed(request, "POST"));
     }
-    if (!request.method().equals("GET")) {
-      return new Routed("other", notAllowed(request, path.equals("/v1/holds") ? "POST" : "GET"));
+    if (!isReadPath(path)) {
+      // An unknown path is 404 for every method: there is no resource whose methods could be
+      // listed.
+      return new Routed("other", notFound(request));
+    }
+    // HEAD is GET without the body (RFC 9110, Section 9.3.2); the server leaves the body out.
+    if (!method.equals("GET") && !method.equals("HEAD")) {
+      return new Routed("other", notAllowed(request, "GET, HEAD"));
     }
     return switch (path) {
       case "/health" -> new Routed("GET /health", noQuery(request, this::health));
@@ -113,6 +117,17 @@ final class SeatWaveRoutes {
       case "/v1/events" -> new Routed("GET /v1/events", noQuery(request, this::events));
       case "/events/1/seats" -> new Routed("GET /events/1/seats", version0SeatMap(request));
       default -> routeByPattern(request);
+    };
+  }
+
+  private static boolean isReadPath(String path) {
+    return switch (path) {
+      case "/health", "/lab/client", "/v1/events", "/events/1/seats" -> true;
+      default ->
+          path.startsWith("/static/")
+              || EVENT_SEATS.matcher(path).matches()
+              || EVENT_CHANGES.matcher(path).matches()
+              || HOLD_PATH.matcher(path).matches();
     };
   }
 
@@ -234,10 +249,12 @@ final class SeatWaveRoutes {
           "send at most " + MAX_BODY_BYTES + " bytes",
           request.correlationId());
     }
+    // The media type is the part before any parameter such as "; charset=utf-8", compared without
+    // case (RFC 9110, Section 8.3.1), so "application/jsonx" is not JSON.
     boolean isJson =
         request
             .header("content-type")
-            .map(type -> type.startsWith("application/json"))
+            .map(type -> type.split(";", 2)[0].strip().equalsIgnoreCase("application/json"))
             .orElse(false);
     if (!isJson) {
       return problems.of(
@@ -291,7 +308,12 @@ final class SeatWaveRoutes {
               holdSeat(request, parsed);
           case Result.Error<HoldRequestBody, JsonCodec.BindingProblem>(
                   JsonCodec.BindingProblem problem) ->
-              invalid(request, List.of(problem.pointer() + " " + problem.detail()));
+              invalid(
+                  request,
+                  List.of(
+                      problem.pointer().isEmpty()
+                          ? problem.detail()
+                          : problem.pointer() + " " + problem.detail()));
         };
     // Final outcomes are stored, so a retry with the same key gets the same answer (Module 7).
     keys.complete(key, fingerprint, reply);
@@ -326,7 +348,10 @@ final class SeatWaveRoutes {
     }
     // A business event: logged with the correlation id and the client the invariant allowed.
     LOG.info(
-        "held {} for 300 s; client {}", body.seat(), request.client().address().getHostAddress());
+        "held {} for {} s; client {}",
+        body.seat(),
+        HoldLedger.HOLD_DURATION.toSeconds(),
+        request.client().address().getHostAddress());
     return Reply.json(CREATED, json.write(HoldView.of(hold.get(), ledger.now())))
         .withHeader("Location", "/v1/holds/" + hold.get().holdId())
         .withHeader("Cache-Control", "no-store");

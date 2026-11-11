@@ -165,11 +165,13 @@ public final class LoadRun {
       String path =
           scenario.uri().getRawPath()
               + (scenario.uri().getRawQuery() == null ? "" : "?" + scenario.uri().getRawQuery());
+      // The Host header as HttpClient writes it: with the port, so both modes send the same
+      // request.
       String head =
           "GET "
               + path
               + " HTTP/1.1\r\nHost: "
-              + host
+              + scenario.uri().getRawAuthority()
               + "\r\nConnection: close\r\n"
               + (scenario.acceptsGzip() ? "Accept-Encoding: gzip\r\n" : "")
               + "\r\n";

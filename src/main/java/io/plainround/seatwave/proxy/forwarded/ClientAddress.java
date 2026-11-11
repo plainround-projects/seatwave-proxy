@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.regex.Pattern;
 
 /**
  * Decides a request's client address and scheme from its peer and its forwarding headers.
@@ -29,6 +30,11 @@ public final class ClientAddress {
 
   /** The longest header line read; RFC 7239 values for 16 hops fit easily. */
   public static final int MAX_HEADER_CHARACTERS = 1_024;
+
+  // An IPv4 address as RFC 7239 and NGINX write it: four decimal parts. InetAddress.ofLiteral also
+  // takes the short forms of old BSD systems, so "127.1" or "2001" would quietly become another
+  // address (127.0.0.1, 0.0.7.209) instead of being refused.
+  private static final Pattern DOTTED_QUAD = Pattern.compile("[0-9]{1,3}(\\.[0-9]{1,3}){3}");
 
   private ClientAddress() {}
 
@@ -84,8 +90,11 @@ public final class ClientAddress {
         return Optional.of(new ClientView(hop.address(), scheme, source));
       }
     }
-    // Every hop is a trusted proxy: the request started inside the trusted path.
-    return Optional.of(new ClientView(hops.getFirst().address(), defaultScheme, source));
+    // Every hop is a trusted proxy: the request started inside the trusted path, at the first hop,
+    // and the scheme is the one that hop was reached with, when the header says it.
+    Hop first = hops.getFirst();
+    String scheme = first.scheme().isEmpty() ? defaultScheme : first.scheme();
+    return Optional.of(new ClientView(first.address(), scheme, source));
   }
 
   private static Optional<List<Hop>> forwardedHops(List<String> lines) {
@@ -166,13 +175,35 @@ public final class ClientAddress {
     // RFC 7239 Section 6: an IPv6 node is in brackets, and any node may carry a port after a colon.
     if (node.startsWith("[")) {
       int closeAt = node.indexOf(']');
-      return closeAt < 0 ? Optional.empty() : literal(node.substring(1, closeAt));
+      if (closeAt < 0 || !node.substring(1, closeAt).contains(":")) {
+        return Optional.empty();
+      }
+      String rest = node.substring(closeAt + 1);
+      return rest.isEmpty() || rest.startsWith(":")
+          ? literal(node.substring(1, closeAt))
+          : Optional.empty();
     }
     int colonAt = node.indexOf(':');
-    return literal(colonAt < 0 ? node : node.substring(0, colonAt));
+    if (colonAt != node.lastIndexOf(':')) {
+      // An IPv6 address without its brackets: the address and a port cannot be told apart, so the
+      // node is refused instead of being cut at its first colon.
+      return Optional.empty();
+    }
+    String address = colonAt < 0 ? node : node.substring(0, colonAt);
+    return address.contains(":") ? Optional.empty() : literal(address);
   }
 
-  private static Optional<InetAddress> literal(String text) {
+  /**
+   * Parses an IP address literal strictly: IPv4 only as four decimal parts, IPv6 as RFC 4291 writes
+   * it, and never a name.
+   *
+   * @param text the literal
+   * @return the address, or empty if the text is not one
+   */
+  static Optional<InetAddress> literal(String text) {
+    if (!text.contains(":") && !DOTTED_QUAD.matcher(text).matches()) {
+      return Optional.empty();
+    }
     try {
       // ofLiteral parses an address and never looks a name up, so "unknown" or a host name is
       // refused instead of sending a DNS query an attacker chose.

@@ -59,7 +59,22 @@ class HoldLedgerTest {
     assertThat(tooEarly).isEmpty();
     assertThat(afterExpiry).isPresent();
     assertThat(ledger.isHeld("B-2")).isTrue();
-    assertThat(ledger.find(first.holdId())).contains(first);
+  }
+
+  @Test
+  void keepsAnExpiredHoldReadableUntilItsSeatIsHeldAgainThenForgetsIt() {
+    MovableClock clock = new MovableClock(NOW);
+    HoldLedger ledger = new HoldLedger(clock);
+    Hold first = ledger.hold(1, "C-3", "fan-1").orElseThrow();
+    clock.advance(HoldLedger.HOLD_DURATION);
+
+    Optional<Hold> expiredButKnown = ledger.find(first.holdId());
+    Hold second = ledger.hold(1, "C-3", "fan-2").orElseThrow();
+
+    assertThat(expiredButKnown).contains(first);
+    // One hold per seat at most: the table cannot grow without end over a long run.
+    assertThat(ledger.find(first.holdId())).isEmpty();
+    assertThat(ledger.find(second.holdId())).contains(second);
   }
 
   /** A clock a test moves forward by hand; used by one thread. */

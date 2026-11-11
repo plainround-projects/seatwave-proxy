@@ -42,7 +42,6 @@ public record BenchSettings(
   // ports, and nothing else, so a typo cannot send load to another host.
   private static final Pattern LAB_URI =
       Pattern.compile("https?://127\\.0\\.0\\.1:209[0-9]{2}/[A-Za-z0-9/._?=&-]*");
-  private static final Pattern FILE = Pattern.compile("[A-Za-z0-9_./-]{1,200}");
   private static final Pattern YES_NO = Pattern.compile("yes|no");
   private static final Pattern MODE = Pattern.compile("reuse|new");
   private static final int MAX_TIMEOUT_MILLIS = 60_000;
@@ -77,7 +76,7 @@ public record BenchSettings(
    */
   public static Result<BenchSettings, List<String>> from(SettingsReader reader) {
     Objects.requireNonNull(reader, "reader");
-    String authority = reader.textMatching("tls.authorityPem", FILE);
+    String authority = reader.filePath("tls.authorityPem");
     Duration connect = reader.millisBetween("client.connectTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration request = reader.millisBetween("client.requestTimeoutMillis", 1, MAX_TIMEOUT_MILLIS);
     Duration warmup = reader.millisBetween("run.warmupMillis", 0, MAX_RUN_MILLIS);

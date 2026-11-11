@@ -169,6 +169,80 @@ class ClientAddressTest {
   }
 
   @Test
+  void refusesAnIpv6ForwardedNodeWithoutItsBrackets() {
+    // RFC 7239 requires the brackets; cut at its first colon, 2001:db8::1 became 0.0.7.209.
+    for (String bare : List.of("for=2001:db8::1", "for=\"2001:db8::1\"", "for=[1.2.3.4]")) {
+      ForwardedHeaders headers = new ForwardedHeaders(List.of(bare), List.of(), List.of());
+
+      ClientView view = ClientAddress.resolve(PROXY, headers, TRUSTED, "https");
+
+      assertThat(view).as(bare).isEqualTo(new ClientView(PROXY, "https", AddressSource.UNREADABLE));
+    }
+  }
+
+  @Test
+  void refusesAnIpv4NodeWithMoreThanOnePort() {
+    ForwardedHeaders headers =
+        new ForwardedHeaders(List.of("for=\"203.0.113.7:4711:80\""), List.of(), List.of());
+
+    ClientView view = ClientAddress.resolve(PROXY, headers, TRUSTED, "https");
+
+    assertThat(view.source()).isEqualTo(AddressSource.UNREADABLE);
+  }
+
+  @Test
+  void refusesTheShortIpv4FormsThatOfLiteralWouldAccept() {
+    for (String shortForm : List.of("127.1", "2001", "10.209.2330")) {
+      ClientView forwardedFor =
+          ClientAddress.resolve(PROXY, xff(List.of(shortForm), List.of()), TRUSTED, "http");
+      ClientView forwarded =
+          ClientAddress.resolve(
+              PROXY,
+              new ForwardedHeaders(List.of("for=" + shortForm), List.of(), List.of()),
+              TRUSTED,
+              "http");
+
+      assertThat(forwardedFor.source()).as(shortForm).isEqualTo(AddressSource.UNREADABLE);
+      assertThat(forwarded.source()).as(shortForm).isEqualTo(AddressSource.UNREADABLE);
+    }
+    assertThat(TrustedProxies.parse(List.of("127.1")).isError()).isTrue();
+  }
+
+  @Test
+  void readsAnIpv6AddressInXForwardedFor() {
+    ClientView view =
+        ClientAddress.resolve(
+            PROXY, xff(List.of("2001:db8::17"), List.of("https")), TRUSTED, "http");
+
+    assertThat(view)
+        .isEqualTo(
+            new ClientView(
+                InetAddress.ofLiteral("2001:db8::17"), "https", AddressSource.X_FORWARDED_FOR));
+  }
+
+  @Test
+  void takesTheFirstHopsProtoWhenEveryForwardedHopIsATrustedProxy() {
+    ForwardedHeaders forwarded =
+        new ForwardedHeaders(List.of("for=10.209.9.10;proto=https"), List.of(), List.of());
+
+    ClientView view = ClientAddress.resolve(SIDECAR, forwarded, TRUSTED, "http");
+
+    // The same answer X-Forwarded-For with X-Forwarded-Proto gives (the test above).
+    assertThat(view).isEqualTo(new ClientView(PROXY, "https", AddressSource.FORWARDED));
+  }
+
+  @Test
+  void believesNoProtoHeaderThatComesWithoutAnAddressHeader() {
+    // NGINX always sends both; a proto header alone says nothing about the client, so the trusted
+    // peer is the client and the listener's own scheme stands.
+    ForwardedHeaders protoOnly = new ForwardedHeaders(List.of(), List.of(), List.of("https"));
+
+    ClientView view = ClientAddress.resolve(PROXY, protoOnly, TRUSTED, "http");
+
+    assertThat(view).isEqualTo(new ClientView(PROXY, "http", AddressSource.PEER));
+  }
+
+  @Test
   void refusesTrustedProxiesThatAreNamesOrEmpty() {
     assertThat(TrustedProxies.parse(List.of("proxy.seatwave.example")).isError()).isTrue();
     assertThat(TrustedProxies.parse(List.of()).isError()).isTrue();

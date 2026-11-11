@@ -26,6 +26,8 @@ public record Counters(long cpuMicros, long passiveOpens, long activeOpens) {
    *
    * @param earlier the reading before the run
    * @return the growth, which is what one run cost
+   * @throws IllegalArgumentException if a counter went down, which happens when the container
+   *     started again between the two readings
    */
   public Counters since(Counters earlier) {
     return new Counters(

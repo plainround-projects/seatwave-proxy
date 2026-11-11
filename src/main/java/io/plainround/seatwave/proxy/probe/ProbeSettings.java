@@ -29,7 +29,6 @@ public record ProbeSettings(
 
   private static final Pattern LAB_URI =
       Pattern.compile("https?://127\\.0\\.0\\.1:209[0-9]{2}/[A-Za-z0-9/._?=&-]*");
-  private static final Pattern FILE = Pattern.compile("[A-Za-z0-9_./-]{1,200}");
   private static final int MAX_MILLIS = 600_000;
 
   /** Checks that nothing is missing. */
@@ -50,7 +49,7 @@ public record ProbeSettings(
    */
   public static Result<ProbeSettings, List<String>> from(SettingsReader reader) {
     String uri = reader.textMatching("probe.uri", LAB_URI);
-    String authority = reader.textMatching("tls.authorityPem", FILE);
+    String authority = reader.filePath("tls.authorityPem");
     Duration interval = reader.millisBetween("probe.intervalMillis", 1, MAX_MILLIS);
     Duration duration = reader.millisBetween("probe.durationMillis", 1, MAX_MILLIS);
     Duration connect = reader.millisBetween("client.connectTimeoutMillis", 1, MAX_MILLIS);

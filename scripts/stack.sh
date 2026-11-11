@@ -74,7 +74,7 @@ fi
 
 echo "plan: $action the Compose project $PROJECT"
 case "$action" in
-  up) echo "  ./gradlew -q stackPrepare; ${compose[*]} up -d --build; wait for $HEALTH_URL" ;;
+  up) echo "  ./gradlew -q stackPrepare; ${compose[*]} up -d --build --quiet-pull; wait for $HEALTH_URL" ;;
   down) echo "  ${compose_all[*]} down -v --remove-orphans; check nothing of $PROJECT is left" ;;
   test) echo "  up, then ./gradlew stackTest, then down -v (always)" ;;
 esac
@@ -97,7 +97,8 @@ up() {
   "${compose[@]}" up -d --build --quiet-pull
   audit "up: started $PROJECT"
   for (( waited = 0; waited < WAIT_SECONDS; waited++ )); do
-    if curl -s -o /dev/null --max-time 2 --cacert "$CA_FILE" "$HEALTH_URL"; then
+    # --fail: a 502 from the proxy while SeatWave is still starting is not "up".
+    if curl -s --fail -o /dev/null --max-time 2 --cacert "$CA_FILE" "$HEALTH_URL"; then
       echo "stack is up: $HEALTH_URL answered after ${waited} s"
       return 0
     fi

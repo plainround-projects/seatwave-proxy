@@ -18,7 +18,7 @@ services:
   backend:
     <<: *hardening
     build: .
-    image: seatwave-proxy-backend:1.0.0
+    image: seatwave-proxy-backend:1.0.1
     cap_drop:
       - ALL
     # Module 1's reference machine has 4 vCPU; SeatWave gets 4 CPUs of the Docker virtual machine.
@@ -73,8 +73,10 @@ services:
       - SETGID
       - SETUID
     # One CPU, and one worker process in nginx.conf: every proxy number is per core. The memory
-    # limit covers the tmpfs folders too (their pages count against it): the cache and the
-    # temporary files of buffered responses, and the access log of a whole bench run.
+    # limit covers the tmpfs folders too: a page written to a tmpfs counts against the container's
+    # memory. Their sizes are ceilings, not reservations, and add up to 901 MB of the 1 GiB; they
+    # never fill together: the cache stays under its max_size of 100m (nginx.conf), and the access
+    # log of a whole measuring session stays well under 600m (README, "The stack").
     cpus: 1
     mem_limit: 1g
     tmpfs:
@@ -106,7 +108,7 @@ services:
   # Only started on demand (profile "tools"); it publishes no port.
   tools:
     <<: *hardening
-    image: seatwave-proxy-backend:1.0.0
+    image: seatwave-proxy-backend:1.0.1
     profiles:
       - tools
     entrypoint: ["/opt/seatwave-java/bin/java", "-cp", "/app/lib/*", "io.plainround.seatwave.proxy.slow.SlowClientsCli"]

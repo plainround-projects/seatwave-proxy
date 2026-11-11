@@ -79,7 +79,11 @@ class BackendServerTest {
     HttpResponse<String> last =
         backend.get(backend.plain("/v1/events/1/seats?limit=2&cursor=czEuVC0xMDAw"));
 
-    assertThat(first.body()).contains("A-1", "A-2", "A-3", "nextCursor");
+    // Each label with its closing quote, so "A-1" cannot be matched by "A-10".
+    assertThat(first.body())
+        .contains("\"seat\":\"A-1\"", "\"seat\":\"A-2\"", "\"seat\":\"A-3\"", "nextCursor")
+        .doesNotContain("\"seat\":\"A-4\"");
+    assertThat(first.body().split("\"seat\":", -1)).hasSize(4);
     assertThat(next.body()).contains("\"seat\":\"B-1\"", "\"seat\":\"B-2\"");
     assertThat(last.body()).isEqualTo("{\"items\":[]}");
   }
@@ -214,7 +218,49 @@ class BackendServerTest {
 
     assertThat(putHold.statusCode()).isEqualTo(405);
     assertThat(putHold.headers().firstValue("allow")).hasValue("POST");
-    assertThat(postEvents.headers().firstValue("allow")).hasValue("GET");
+    assertThat(postEvents.statusCode()).isEqualTo(405);
+    assertThat(postEvents.headers().firstValue("allow")).hasValue("GET, HEAD");
+  }
+
+  @Test
+  void answersAnUnknownPathWithNotFoundWhateverTheMethod() {
+    HttpResponse<String> postNothing =
+        backend.send(post("/nothing", "application/json", "{}").build());
+
+    assertThat(postNothing.statusCode()).isEqualTo(404);
+    assertThat(postNothing.headers().firstValue("allow")).isEmpty();
+  }
+
+  @Test
+  void answersHeadWithTheHeadersOfGetAndNoBody() {
+    HttpResponse<String> head =
+        backend.send(
+            HttpRequest.newBuilder(backend.plain("/events/1/seats?section=A"))
+                .timeout(TIMEOUT)
+                .HEAD()
+                .build());
+
+    assertThat(head.statusCode()).isEqualTo(200);
+    assertThat(head.body()).isEmpty();
+    assertThat(head.headers().firstValue("content-length")).hasValue("36894");
+    assertThat(head.headers().firstValue("cache-control")).hasValue("no-cache");
+  }
+
+  @Test
+  void acceptsOnlyTheJsonMediaTypeWithOrWithoutParameters() {
+    HttpResponse<String> lookalike =
+        backend.send(
+            post("/v1/holds", "application/jsonx", body("E-1", "fan-1"))
+                .header("Idempotency-Key", "\"key-9\"")
+                .build());
+    HttpResponse<String> withCharset =
+        backend.send(
+            post("/v1/holds", "Application/JSON; charset=utf-8", body("E-2", "fan-1"))
+                .header("Idempotency-Key", "\"key-10\"")
+                .build());
+
+    assertThat(lookalike.statusCode()).isEqualTo(415);
+    assertThat(withCharset.statusCode()).isEqualTo(201);
   }
 
   @Test
@@ -280,6 +326,16 @@ class BackendServerTest {
     backend.get(backend.plain("/health"));
     backend.get(backend.plain("/nothing"));
 
+    // A request is counted when its worker finishes, which can be just after the client has read
+    // the whole answer, so the test waits for the count instead of reading it once.
+    await()
+        .atMost(TIMEOUT)
+        .until(() -> {
+          String text = backend.metrics();
+          return text.contains("route=\"other\",status=\"404\"} 1")
+              && text.contains("route=\"GET /health\",status=\"200\"} 1")
+              && text.contains("seatwave_workers_busy 0");
+        });
     String metrics = backend.metrics();
 
     assertThat(metrics)

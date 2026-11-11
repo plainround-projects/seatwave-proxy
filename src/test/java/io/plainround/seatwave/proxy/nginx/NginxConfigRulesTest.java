@@ -6,9 +6,11 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.MatchResult;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -27,10 +29,18 @@ class NginxConfigRulesTest {
   private static final Pattern LISTEN = Pattern.compile("(?m)^\\s*listen (\\d+)");
   private static final Pattern PUBLISHED = Pattern.compile("\"127\\.0\\.0\\.1:(\\d+):(\\d+)\"");
   private static final Pattern ANY_PORT_LINE = Pattern.compile("(?m)^\\s+- \"([^\"]*:[^\"]*)\"$");
+  private static final Pattern UPSTREAM = Pattern.compile("(?s)upstream ([a-z_]+) \\{([^}]*)\\}");
+  private static final Pattern KEEPALIVE = Pattern.compile("(?m)^\\s*keepalive (\\d+);");
   private static final Pattern KEEPALIVE_TIMEOUT =
-      Pattern.compile("(?s)upstream [a-z_]+ \\{[^}]*?keepalive_timeout (\\d+)s;");
+      Pattern.compile("(?m)^\\s*keepalive_timeout ([^;]+);");
+  // An NGINX time: a number and a unit (ms, s, m, h); a number alone is seconds.
+  private static final Pattern NGINX_TIME = Pattern.compile("(\\d+)(ms|s|m|h)?");
+  // A Compose service starts at two spaces of indentation under "services:".
+  private static final Pattern SERVICE = Pattern.compile("(?m)^  ([a-z]+):$");
+  private static final Pattern SETTINGS_PORT =
+      Pattern.compile("(?m)^http\\.(?:plain|tls|admin)Port=(\\d+)$");
   // The JDK's HTTP server closes an idle connection after 30 s (sun.net.httpserver.idleInterval).
-  private static final int BACKEND_IDLE_SECONDS = 30;
+  private static final Duration BACKEND_IDLE = Duration.ofSeconds(30);
   private static final int LOWEST_LAB_PORT = 20_900;
   private static final int HIGHEST_LAB_PORT = 20_999;
 
@@ -53,7 +63,11 @@ class NginxConfigRulesTest {
 
     assertThat(headers)
         .contains("proxy_set_header X-Forwarded-For $remote_addr;")
-        .contains("proxy_set_header Forwarded \"for=$remote_addr;proto=$scheme\";");
+        .contains("proxy_set_header Forwarded \"for=\\\"$forwarded_node\\\";proto=$scheme\";");
+    // RFC 7239: an IPv6 node goes in brackets, and only the map in nginx.conf adds them.
+    assertThat(read(NGINX.resolve("nginx.conf")))
+        .containsPattern(
+            "(?s)map \\$remote_addr \\$forwarded_node \\{\\s*~:\\s+\"\\[\\$remote_addr\\]\";");
     for (Path file : edgeFiles()) {
       assertThat(read(file)).as(file.toString()).doesNotContain("$proxy_add_x_forwarded_for");
     }
@@ -75,26 +89,51 @@ class NginxConfigRulesTest {
 
   @Test
   void closesIdleUpstreamConnectionsBeforeSeatWaveDoes() throws IOException {
-    List<Integer> timeouts = new ArrayList<>();
+    int reusingUpstreams = 0;
     for (Path file : allFiles()) {
-      Matcher matcher = KEEPALIVE_TIMEOUT.matcher(read(file));
-      while (matcher.find()) {
-        timeouts.add(Integer.parseInt(matcher.group(1)));
+      Matcher upstream = UPSTREAM.matcher(read(file).replaceAll("(?m)#.*$", ""));
+      while (upstream.find()) {
+        String body = upstream.group(2);
+        Matcher keepalive = KEEPALIVE.matcher(body);
+        // Since NGINX 1.29.7 an upstream keeps idle connections unless it says keepalive 0.
+        boolean reuses = !keepalive.find() || Integer.parseInt(keepalive.group(1)) > 0;
+        if (!reuses) {
+          continue;
+        }
+        reusingUpstreams++;
+        Matcher timeout = KEEPALIVE_TIMEOUT.matcher(body);
+        // Without the directive NGINX keeps an idle connection 60 s, longer than SeatWave's 30 s.
+        assertThat(timeout.find())
+            .as("keepalive_timeout in upstream " + upstream.group(1))
+            .isTrue();
+        assertThat(nginxTime(timeout.group(1).strip()))
+            .as("keepalive_timeout of upstream " + upstream.group(1))
+            .isLessThan(BACKEND_IDLE);
+        assertThat(timeout.find())
+            .as("a second keepalive_timeout in " + upstream.group(1))
+            .isFalse();
       }
     }
 
-    assertThat(timeouts).isNotEmpty().allMatch(seconds -> seconds < BACKEND_IDLE_SECONDS);
+    assertThat(reusingUpstreams).isPositive();
+  }
+
+  @Test
+  void readsNginxTimesInEveryUnitTheConfigurationMayUse() {
+    assertThat(nginxTime("20s")).isEqualTo(Duration.ofSeconds(20));
+    assertThat(nginxTime("20")).isEqualTo(Duration.ofSeconds(20));
+    assertThat(nginxTime("1m")).isEqualTo(Duration.ofMinutes(1));
+    assertThat(nginxTime("2500ms")).isEqualTo(Duration.ofMillis(2_500));
+    assertThat(nginxTime("1h")).isEqualTo(Duration.ofHours(1));
   }
 
   @Test
   void publishesEveryProxyPortOnTheLoopbackAddressInTheModulesRange() throws IOException {
     String compose = read(Path.of("compose.yaml"));
     Matcher published = PUBLISHED.matcher(compose);
-    Set<Integer> containerPorts = new java.util.HashSet<>();
     List<Integer> hostPorts = new ArrayList<>();
     while (published.find()) {
       hostPorts.add(Integer.parseInt(published.group(1)));
-      containerPorts.add(Integer.parseInt(published.group(2)));
     }
     Set<Integer> listened =
         edgeFiles().stream()
@@ -108,7 +147,22 @@ class NginxConfigRulesTest {
     assertThat(hostPorts).doesNotHaveDuplicates();
     assertThat(ANY_PORT_LINE.matcher(compose).results().map(match -> match.group(1)))
         .allMatch(line -> line.startsWith("127.0.0.1:"));
-    assertThat(containerPorts).containsAll(listened);
+    // Per service: every port the proxy listens on is published, and nothing else of the proxy.
+    assertThat(containerPorts(service(compose, "proxy"))).isEqualTo(listened);
+  }
+
+  @Test
+  void publishesExactlyTheBackendPortsItsContainerSettingsListenOn() throws IOException {
+    String compose = read(Path.of("compose.yaml"));
+    Set<Integer> listened =
+        SETTINGS_PORT
+            .matcher(read(Path.of("config/backend-container.properties")))
+            .results()
+            .map(match -> Integer.parseInt(match.group(1)))
+            .collect(Collectors.toSet());
+
+    assertThat(listened).hasSize(3);
+    assertThat(containerPorts(service(compose, "backend"))).isEqualTo(listened);
   }
 
   @Test
@@ -125,6 +179,39 @@ class NginxConfigRulesTest {
         .hasSize(2)
         .allMatch(line -> line.contains("@sha256:"));
     assertThat(dockerfile).contains("USER 10001");
+  }
+
+  private static String service(String compose, String name) {
+    List<MatchResult> services = SERVICE.matcher(compose).results().toList();
+    for (int index = 0; index < services.size(); index++) {
+      if (services.get(index).group(1).equals(name)) {
+        int end = index + 1 < services.size() ? services.get(index + 1).start() : compose.length();
+        return compose.substring(services.get(index).end(), end);
+      }
+    }
+    throw new IllegalStateException("compose.yaml has no service " + name);
+  }
+
+  private static Set<Integer> containerPorts(String service) {
+    return PUBLISHED
+        .matcher(service)
+        .results()
+        .map(match -> Integer.parseInt(match.group(2)))
+        .collect(Collectors.toSet());
+  }
+
+  private static Duration nginxTime(String text) {
+    Matcher time = NGINX_TIME.matcher(text);
+    if (!time.matches()) {
+      throw new IllegalArgumentException("not an NGINX time this test reads: " + text);
+    }
+    long amount = Long.parseLong(time.group(1));
+    return switch (time.group(2) == null ? "s" : time.group(2)) {
+      case "ms" -> Duration.ofMillis(amount);
+      case "m" -> Duration.ofMinutes(amount);
+      case "h" -> Duration.ofHours(amount);
+      default -> Duration.ofSeconds(amount);
+    };
   }
 
   private static List<Path> edgeFiles() throws IOException {

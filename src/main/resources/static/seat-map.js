@@ -49,36 +49,50 @@ function drawSection(container, seats) {
   container.replaceChildren(fragment);
 }
 
-// Holds one seat with an Idempotency-Key, so a retry after a lost reply cannot hold twice.
+// Holds one seat with an Idempotency-Key, so a retry after a lost reply cannot hold twice. Only a
+// lost connection, a 5xx answer or "request-in-progress" (the same key is still running) is tried
+// again; any other answer is final.
+const SEATWAVE_HOLD_ATTEMPTS = 3;
+const SEATWAVE_IN_PROGRESS = "https://seatwave.example/problems/request-in-progress";
+
 async function holdSeat(seat, customer) {
   const key = `"${crypto.randomUUID()}"`;
   const body = JSON.stringify({ eventId: SEATWAVE_EVENT_ID, seat, customer });
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 1; attempt <= SEATWAVE_HOLD_ATTEMPTS; attempt += 1) {
+    let response = null;
     try {
-      const response = await fetch("/v1/holds", {
+      response = await fetch("/v1/holds", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Idempotency-Key": key },
         body,
       });
+    } catch (networkError) {
+      if (attempt === SEATWAVE_HOLD_ATTEMPTS) {
+        throw networkError;
+      }
+    }
+    if (response !== null) {
       if (response.status === 201) {
         return await response.json();
       }
       if (response.status === 409) {
-        return null;
-      }
-      if (response.status < 500) {
+        const problem = await response.json();
+        if (problem.type !== SEATWAVE_IN_PROGRESS) {
+          // The seat is held or sold.
+          return null;
+        }
+      } else if (response.status < 500) {
+        // A 4xx other than 409 says the request itself is wrong; sending it again cannot help.
         throw new Error(`hold answered ${response.status}`);
       }
-    } catch (networkError) {
-      if (attempt === 2) {
-        throw networkError;
-      }
     }
-    // Back off 1, then 2 seconds, with jitter, as Module 4 taught.
-    const backoffMillis = 1000 * 2 ** attempt * (0.5 + Math.random());
-    await new Promise((resolve) => setTimeout(resolve, backoffMillis));
+    if (attempt < SEATWAVE_HOLD_ATTEMPTS) {
+      // Back off 1, then 2 seconds, with jitter, as Module 4 taught.
+      const backoffMillis = 1000 * 2 ** (attempt - 1) * (0.5 + Math.random());
+      await new Promise((resolve) => setTimeout(resolve, backoffMillis));
+    }
   }
-  throw new Error("hold did not succeed after three attempts");
+  throw new Error(`hold did not succeed after ${SEATWAVE_HOLD_ATTEMPTS} attempts`);
 }
 
 // Starts the page: draws section A, refreshes it every two seconds, and holds on a click.

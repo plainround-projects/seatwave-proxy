@@ -14,8 +14,11 @@ import java.util.regex.Pattern;
  */
 public record Scenario(String name, URI uri, boolean acceptsGzip, ConnectionMode mode) {
 
-  /** A scenario name: lower-case letters, digits and hyphens, at most 24 characters. */
-  public static final Pattern NAME = Pattern.compile("[a-z][a-z0-9-]{0,23}");
+  /**
+   * A scenario name: lower-case letters, digits and hyphens, at most 17 characters, the width of
+   * the bench table's first column.
+   */
+  public static final Pattern NAME = Pattern.compile("[a-z][a-z0-9-]{0,16}");
 
   /**
    * Creates the scenario.

@@ -16,7 +16,7 @@ plugins {
 }
 
 group = "io.plainround"
-version = "1.0.0"
+version = "1.0.1"
 
 java {
     toolchain {
@@ -124,10 +124,16 @@ abstract class TestCertificates : DefaultTask() {
                 "-deststorepass:file", passwordPath, "-destalias", "seatwave"),
         )
         writePem(serverStore, password, directory)
-        // Readable by the containers' own users (NGINX and SeatWave run under other user ids), and
-        // never committed: .gitignore refuses every one of these file types.
+        // The files the containers read are rw-r--r--: on a Linux host a bind mount keeps the host's
+        // owner and mode, and the containers read them as other users (NGINX's master as root
+        // without CAP_DAC_OVERRIDE, SeatWave as uid 10001), so owner-only files could not be read.
+        // Docker Desktop on a Mac shows every shared file as owned by the user reading it, so there
+        // rw------- works too. The CA's keystore, which holds the CA's private key, is read by no
+        // container and stays rw-------. Nothing here is ever committed: .gitignore refuses these
+        // file types, and the keys are TEST keys made again every day.
         directory.listFiles().orEmpty().forEach { file ->
-            Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString("rw-r--r--"))
+            val mode = if (file.name == "seatwave-test-ca.p12") "rw-------" else "rw-r--r--"
+            Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString(mode))
         }
     }
 

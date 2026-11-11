@@ -36,19 +36,21 @@ done
 cd "$(dirname "$0")/.."
 compose=(docker compose -p "$PROJECT")
 
-# Check before: the service must be running.
-"${compose[@]}" ps --status running --services 2> /dev/null | grep -qx "$service" \
-  || { echo "the $service of $PROJECT is not running: run scripts/stack.sh up --run first" >&2; exit 1; }
-
 if [[ "$action" == "reload" ]]; then
   echo "plan: probe https://127.0.0.1:20900/health for 30 s; nginx -t and nginx -s reload at ${STOP_AFTER_SECONDS} s and again 5 s later"
 else
   echo "plan: probe https://127.0.0.1:20900/health for 30 s; stop $service at ${STOP_AFTER_SECONDS} s, start it at $(( STOP_AFTER_SECONDS + DOWN_FOR_SECONDS )) s"
 fi
+# Check before: the service must be running. A dry run only says so, because it changes nothing.
+is_running="yes"
+"${compose[@]}" ps --status running --services 2> /dev/null | grep -qx "$service" || is_running="no"
 if [[ "$mode" == "dry-run" ]]; then
+  [[ "$is_running" == "yes" ]] || echo "note: the $service of $PROJECT is not running now; start it with scripts/stack.sh up --run"
   echo "dry run: nothing changed. Add --run to do it."
   exit 0
 fi
+[[ "$is_running" == "yes" ]] \
+  || { echo "the $service of $PROJECT is not running: run scripts/stack.sh up --run first" >&2; exit 1; }
 if [[ "$confirmed" != "yes" ]]; then
   read -r -p "Go ahead with '$action' on $service of $PROJECT? [y/N] " answer < /dev/tty
   [[ "$answer" == "y" ]] || { echo "not confirmed; nothing changed" >&2; exit 1; }
@@ -93,6 +95,12 @@ cat build/stack/probe-"$action".txt
 if [[ "$service" == "backend" ]]; then
   "${compose[@]}" restart sidecar > /dev/null 2>&1
   new_errors=$("${compose[@]}" logs --no-log-prefix proxy 2>&1 | tail -n +"$(( log_lines_before + 1 ))" | grep -E '\[error\].*GET /health' || true)
-  echo "the proxy logged $(printf '%s' "$new_errors" | grep -c . || true) error line(s) for /health while SeatWave was down; the first and the last:"
-  printf '%s\n' "$new_errors" | sed -n '1p;$p' | sed 's/^[0-9/]* [0-9:]* //'
+  error_count=$(printf '%s' "$new_errors" | grep -c . || true)
+  if (( error_count > 1 )); then
+    echo "the proxy logged $error_count error lines for /health while SeatWave was down; the first and the last:"
+  else
+    echo "the proxy logged $error_count error line(s) for /health while SeatWave was down:"
+  fi
+  # The first line, and the last one only if it is another line.
+  printf '%s\n' "$new_errors" | sed -n '1p;1!{$p;}' | sed 's/^[0-9/]* [0-9:]* //'
 fi

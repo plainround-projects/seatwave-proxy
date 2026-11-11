@@ -10,6 +10,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
 class ContainerCountersTest {
@@ -44,6 +46,7 @@ class ContainerCountersTest {
   }
 
   @Test
+  @DisabledOnOs(value = OS.WINDOWS, disabledReason = "the stand-in for docker is a /bin/sh script")
   void runsTheCommandAsAListAndParsesWhatItPrints(@TempDir Path folder) throws Exception {
     Path fakeDocker = script(folder, "cat <<'END'\n" + SAMPLE + "END");
 
@@ -53,6 +56,7 @@ class ContainerCountersTest {
   }
 
   @Test
+  @DisabledOnOs(value = OS.WINDOWS, disabledReason = "the stand-in for docker is a /bin/sh script")
   void reportsAFailedCommandAndRefusesANameThatIsNotAContainerName(@TempDir Path folder)
       throws Exception {
     Path failingDocker = script(folder, "echo 'No such container' >&2; exit 1");

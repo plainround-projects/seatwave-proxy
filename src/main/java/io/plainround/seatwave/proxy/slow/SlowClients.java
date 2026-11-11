@@ -40,6 +40,12 @@ import java.util.regex.Pattern;
 public final class SlowClients {
 
   private static final Pattern STATUS_LINE = Pattern.compile("HTTP/1\\.[01] (\\d{3}) .*");
+  private static final Pattern CONTENT_LENGTH =
+      Pattern.compile("(?im)^content-length:[ \\t]*(\\d{1,18})[ \\t]*\\r?$");
+  private static final String HEAD_END = "\r\n\r\n";
+  // The most bytes of response head kept: NGINX's and the JDK server's heads are far smaller, and a
+  // head that does not end by then is not one this lab produces.
+  private static final int MAX_HEAD_BYTES = 16_384;
   private static final Pattern BUSY = Pattern.compile("(?m)^seatwave_workers_busy (\\d+)$");
   private static final Pattern WORKERS = Pattern.compile("(?m)^seatwave_workers (\\d+)$");
   private static final Pattern BUSY_SECONDS =
@@ -117,12 +123,13 @@ public final class SlowClients {
       InputStream in = socket.getInputStream();
       byte[] buffer = new byte[settings.bytesPerTick()];
       long total = 0;
+      // The head is collected across reads, so a client that reads a few bytes per tick still
+      // sees the whole status line and Content-Length.
       StringBuilder head = new StringBuilder();
       int read;
       while ((read = in.readNBytes(buffer, 0, buffer.length)) > 0) {
-        if (head.length() < buffer.length) {
-          head.append(
-              new String(buffer, 0, Math.min(read, buffer.length), StandardCharsets.ISO_8859_1));
+        if (head.length() < MAX_HEAD_BYTES) {
+          head.append(new String(buffer, 0, read, StandardCharsets.ISO_8859_1));
         }
         total += read;
         if (read < buffer.length) {
@@ -130,8 +137,10 @@ public final class SlowClients {
         }
         Thread.sleep(settings.tick());
       }
-      int status = status(head.toString());
-      return new Download(status == OK, total, Duration.ofNanos(System.nanoTime() - startNanos));
+      return new Download(
+          isComplete(head.toString(), total),
+          total,
+          Duration.ofNanos(System.nanoTime() - startNanos));
     } catch (IOException failed) {
       return new Download(false, 0, Duration.ofNanos(System.nanoTime() - startNanos));
     } catch (InterruptedException interrupted) {
@@ -237,6 +246,25 @@ public final class SlowClients {
     }
     int rank = (int) Math.ceil(share * sorted.size());
     return sorted.get(Math.max(rank, 1) - 1);
+  }
+
+  /**
+   * Says whether a download read a whole 200 response: the status is 200, the head ended, and the
+   * body after it is exactly as long as Content-Length promised. A server that closes early, or a
+   * reply without a length (which this lab never sends), is not a complete download.
+   *
+   * @param head the first bytes of the response, at least the whole head
+   * @param total every byte read, head included
+   * @return true for a complete 200 response
+   */
+  static boolean isComplete(String head, long total) {
+    int headEnd = head.indexOf(HEAD_END);
+    if (status(head) != OK || headEnd < 0) {
+      return false;
+    }
+    Matcher length = CONTENT_LENGTH.matcher(head.substring(0, headEnd + HEAD_END.length()));
+    long bodyBytes = total - headEnd - HEAD_END.length();
+    return length.find() && Long.parseLong(length.group(1)) == bodyBytes;
   }
 
   static int status(String head) {

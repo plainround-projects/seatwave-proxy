@@ -44,8 +44,17 @@ final class HoldLedger {
     Hold owner =
         holdsBySeat.compute(
             seat,
-            (label, existing) ->
-                existing == null || !existing.isActiveAt(now) ? candidate : existing);
+            (label, existing) -> {
+              if (existing != null && existing.isActiveAt(now)) {
+                return existing;
+              }
+              if (existing != null) {
+                // The expired hold this one replaces is forgotten, so the table holds at most one
+                // hold per seat and cannot grow without end over a long run.
+                holdsById.remove(existing.holdId());
+              }
+              return candidate;
+            });
     if (owner != candidate) {
       return Optional.empty();
     }
@@ -53,6 +62,12 @@ final class HoldLedger {
     return Optional.of(candidate);
   }
 
+  /**
+   * Finds a hold by its identifier: an active one, or an expired one whose seat nobody has held
+   * since.
+   *
+   * @return the hold, or empty once its seat has a newer hold
+   */
   Optional<Hold> find(String holdId) {
     return Optional.ofNullable(holdsById.get(holdId));
   }

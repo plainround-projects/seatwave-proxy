@@ -43,6 +43,23 @@ class BackendCliTest {
   }
 
   @Test
+  void refusesASettingsFileWithABrokenEscapeWithoutAStackTrace(@TempDir Path folder)
+      throws IOException {
+    Path file =
+        Files.writeString(
+            folder.resolve("broken.properties"),
+            "http.bindAddress=\\u12\n",
+            StandardCharsets.UTF_8);
+
+    Optional<BackendServer> server =
+        BackendCli.start(new String[] {file.toString()}, print(out), print(err));
+
+    assertThat(server).isEmpty();
+    assertThat(err.toString(StandardCharsets.UTF_8))
+        .contains("is not a valid properties file: Malformed \\uxxxx encoding.");
+  }
+
+  @Test
   void saysWhichTlsFileIsMissing(@TempDir Path folder) throws IOException {
     String settings =
         Files.readString(Path.of("config/backend-local.properties"), StandardCharsets.UTF_8)

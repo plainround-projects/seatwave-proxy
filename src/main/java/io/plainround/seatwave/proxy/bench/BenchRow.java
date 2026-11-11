@@ -24,33 +24,27 @@ public record BenchRow(Scenario scenario, LoadResult result, Counters proxy, Cou
   }
 
   /**
-   * Returns the proxy's CPU time per thousand successful requests.
+   * Returns the proxy's CPU time per thousand requests sent.
    *
-   * @return milliseconds of CPU, or 0 when nothing succeeded
+   * @return milliseconds of CPU, or 0 when nothing was sent
    */
   public double proxyCpuMillisPerThousand() {
     return perThousand(proxy.cpuMicros() / MICROS_PER_MILLI);
   }
 
   /**
-   * Returns SeatWave's CPU time per thousand successful requests.
+   * Returns SeatWave's CPU time per thousand requests sent.
    *
-   * @return milliseconds of CPU, or 0 when nothing succeeded
+   * @return milliseconds of CPU, or 0 when nothing was sent
    */
   public double backendCpuMillisPerThousand() {
     return perThousand(backend.cpuMicros() / MICROS_PER_MILLI);
   }
 
-  /**
-   * Returns the connections SeatWave accepted per thousand successful requests.
-   *
-   * @return connections, or 0 when nothing succeeded
-   */
-  public double backendConnectionsPerThousand() {
-    return perThousand(backend.passiveOpens());
-  }
-
   private double perThousand(double amount) {
-    return result.requests() == 0 ? 0 : amount * PER_THOUSAND / result.requests();
+    // Every request sent, successful or not: a container spends CPU on a failed request too, so
+    // dividing by the successes alone would charge the failures' CPU to them.
+    long sent = Math.addExact(result.requests(), result.errors());
+    return sent == 0 ? 0 : amount * PER_THOUSAND / sent;
   }
 }

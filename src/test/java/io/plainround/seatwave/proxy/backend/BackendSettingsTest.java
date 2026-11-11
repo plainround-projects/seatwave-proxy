@@ -52,6 +52,31 @@ class BackendSettingsTest {
   }
 
   @Test
+  void reportsMissingStreamKeysOnceWithoutTheRuleBetweenThem() throws IOException {
+    Properties file = SettingsReader.load(Path.of("config/backend-local.properties"));
+    file.remove("feed.heartbeatMillis");
+    file.remove("feed.streamLifetimeMillis");
+
+    Result<BackendSettings, List<String>> result = BackendSettings.from(new SettingsReader(file));
+
+    assertThat(((Result.Error<BackendSettings, List<String>>) result).error())
+        .containsExactly("feed.heartbeatMillis is missing", "feed.streamLifetimeMillis is missing");
+  }
+
+  @Test
+  void refusesAShortIpv4FormAsATrustedProxy() throws IOException {
+    Properties file = SettingsReader.load(Path.of("config/backend-local.properties"));
+    // 127.0.1 is the old BSD short form of 127.0.0.1: written by mistake, it must not trust anyone.
+    file.setProperty("forwarded.trustedProxies", "127.0.1");
+
+    Result<BackendSettings, List<String>> result = BackendSettings.from(new SettingsReader(file));
+
+    assertThat(((Result.Error<BackendSettings, List<String>>) result).error())
+        .containsExactly(
+            "forwarded.trustedProxies: a trusted proxy must be an IP address, but was '127.0.1'");
+  }
+
+  @Test
   void refusesListenersThatShareAPortWhenBuiltDirectly() {
     BackendSettings.Timing timing = TestBackend.quickTiming();
 

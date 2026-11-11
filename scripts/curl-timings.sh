@@ -49,7 +49,8 @@ done
 # Check before: the tool, the inputs and the output.
 command -v curl >/dev/null || { echo "curl is not installed" >&2; exit 1; }
 [[ -f "$targets_file" ]] || { echo "no targets file: $targets_file" >&2; exit 2; }
-[[ "$runs" =~ ^[0-9]+$ ]] && (( runs >= 1 && runs <= MAX_RUNS )) \
+# No leading zero: bash would read "08" as a broken octal number and "010" as 8.
+[[ "$runs" =~ ^[1-9][0-9]*$ ]] && (( runs <= MAX_RUNS )) \
   || { echo "runs must be 1 to $MAX_RUNS" >&2; exit 2; }
 [[ ! -e "$out_file" ]] || { echo "refusing to overwrite $out_file" >&2; exit 2; }
 
@@ -57,7 +58,8 @@ names=()
 urls=()
 cacerts=()
 encodings=()
-while read -r name url cacert encoding extra; do
+# "|| [[ -n ... ]]" also reads a last line that has no line break after it.
+while read -r name url cacert encoding extra || [[ -n "${name:-}" ]]; do
   [[ -z "${name:-}" || "$name" == \#* ]] && continue
   [[ -z "${extra:-}" ]] || { echo "too many fields for $name" >&2; exit 2; }
   [[ "$name" =~ $NAME_PATTERN ]] || { echo "invalid name: $name" >&2; exit 2; }

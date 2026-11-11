@@ -31,6 +31,28 @@ class ReportCliTest {
   }
 
   @Test
+  void stopsWithStatusOneAndNamesALineItRefused(@TempDir Path folder) throws Exception {
+    Path lines =
+        Files.write(
+            folder.resolve("timings.txt"),
+            java.util.List.of(
+                CurlLineTest.NEW_HTTPS,
+                CurlLineTest.NEW_HTTPS,
+                CurlLineTest.NEW_HTTPS,
+                "seatwave-https dns=not-a-number"),
+            StandardCharsets.UTF_8);
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    PrintStream printer = new PrintStream(out, true, StandardCharsets.UTF_8);
+
+    int status = ReportCli.run(new String[] {lines.toString()}, printer, printer);
+
+    assertThat(status).isEqualTo(ReportCli.EXIT_REFUSED_LINES);
+    assertThat(out.toString(StandardCharsets.UTF_8))
+        .contains("seatwave-https    new        HTTP/1.1     3")
+        .contains("dns=not-a-number");
+  }
+
+  @Test
   void refusesBadUsageAMissingFileAndTooFewRuns(@TempDir Path folder) throws Exception {
     Path one =
         Files.writeString(

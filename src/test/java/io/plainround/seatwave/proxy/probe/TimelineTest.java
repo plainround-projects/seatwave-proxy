@@ -43,7 +43,20 @@ class TimelineTest {
         .endsWith(
             "outage: 0.200 s from the first failed request to the first success after the last"
                 + System.lineSeparator());
-    assertThat(Timeline.render(List.of(outcome(0, "200", 1)))).contains("outage: none");
+  }
+
+  @Test
+  void tellsAProbeWithoutFailuresFromOneThatEndedInAnOutage() {
+    String clean = Timeline.render(List.of(outcome(0, "200", 1), outcome(100, "200", 1)));
+    String stillDown =
+        Timeline.render(
+            List.of(outcome(0, "connection refused", 1), outcome(100, "connection refused", 1)));
+
+    assertThat(clean).endsWith("outage: none, every request succeeded" + System.lineSeparator());
+    assertThat(stillDown)
+        .endsWith(
+            "outage: from 0.000 s to the end of the probe, with no success after it"
+                + System.lineSeparator());
   }
 
   @Test

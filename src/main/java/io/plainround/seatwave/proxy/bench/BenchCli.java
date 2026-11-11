@@ -56,7 +56,22 @@ public final class BenchCli {
     if (loaded.isEmpty()) {
       return EXIT_BAD_USAGE;
     }
-    BenchSettings settings = loaded.get();
+    return bench(loaded.get(), counters, out, err);
+  }
+
+  /**
+   * Runs every scenario of checked settings and prints the table.
+   *
+   * @param settings the checked settings
+   * @param counters reads each container's counters
+   * @param out where the table is printed
+   * @param err where problems are printed
+   * @return 0, or 1 if the stack could not be reached or read
+   * @throws InterruptedException if the thread is interrupted during a run
+   */
+  static int bench(
+      BenchSettings settings, ContainerCounters counters, PrintStream out, PrintStream err)
+      throws InterruptedException {
     try {
       LoadRun runner =
           new LoadRun(
@@ -100,8 +115,26 @@ public final class BenchCli {
       Counters backendAfter = counters.read(settings.backendContainer());
       runs.add(
           new BenchRow(
-              scenario, result, proxyAfter.since(proxyBefore), backendAfter.since(backendBefore)));
+              scenario,
+              result,
+              growth(settings.proxyContainer(), proxyBefore, proxyAfter),
+              growth(settings.backendContainer(), backendBefore, backendAfter)));
     }
     return runs;
+  }
+
+  private static Counters growth(String container, Counters before, Counters after)
+      throws IOException {
+    try {
+      return after.since(before);
+    } catch (IllegalArgumentException wentDown) {
+      // A counter that went down means the container started again during the run, so the run
+      // measured nothing; that is a failure of the stack, reported like one, not a stack trace.
+      throw new IOException(
+          "the counters of "
+              + container
+              + " went down during a run, so the container restarted; run the bench again",
+          wentDown);
+    }
   }
 }

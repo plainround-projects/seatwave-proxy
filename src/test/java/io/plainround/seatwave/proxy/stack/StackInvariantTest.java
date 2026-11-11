@@ -10,7 +10,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
+import java.util.Optional;
+import java.util.SplittableRandom;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.junit.jupiter.api.AfterAll;
@@ -31,6 +35,12 @@ class StackInvariantTest {
   private static final String METRICS = "http://127.0.0.1:20912/metrics";
   private static final String FORGED = "203.0.113.7";
   private static final Duration TIMEOUT = Duration.ofSeconds(10);
+  private static final int SEATS_PER_SECTION = 1_000;
+  private static final int CONFLICT = 409;
+  private static final int MAX_SEAT_ATTEMPTS = 50;
+  // A random first seat, so two runs within one hold's 300 s rarely start on the same seat.
+  private static final AtomicInteger NEXT_SEAT =
+      new AtomicInteger(new SplittableRandom().nextInt(SEATS_PER_SECTION));
   private static HttpClient client;
 
   @BeforeAll
@@ -63,26 +73,29 @@ class StackInvariantTest {
   void neverAnswersAPostFromTheCache() throws Exception {
     long before = count("POST /v1/holds", "201");
 
-    HttpResponse<String> first = hold("A-" + seat());
-    HttpResponse<String> second = hold("A-" + seat());
+    HttpResponse<String> first = hold("A");
+    HttpResponse<String> second = hold("A");
 
     assertThat(first.statusCode()).isEqualTo(201);
     assertThat(second.statusCode()).isEqualTo(201);
-    assertThat(first.headers().firstValue("x-cache-status"))
-        .isNotEqualTo(java.util.Optional.of("HIT"));
+    assertThat(first.body()).isNotEqualTo(second.body());
+    for (HttpResponse<String> answer : List.of(first, second)) {
+      assertThat(answer.headers().firstValue("x-cache-status")).isNotEqualTo(Optional.of("HIT"));
+    }
     assertThat(count("POST /v1/holds", "201")).isEqualTo(before + 2);
   }
 
   @Test
   void neverAnswersAPrivateResponseFromTheCache() throws Exception {
-    String location = hold("B-" + seat()).headers().firstValue("location").orElseThrow();
+    String location = hold("B").headers().firstValue("location").orElseThrow();
     long before = count("GET /v1/holds/{holdId}", "200");
 
     HttpResponse<String> first = get(PROXY + location);
     HttpResponse<String> second = get(PROXY + location);
 
-    assertThat(second.headers().firstValue("x-cache-status"))
-        .isNotEqualTo(java.util.Optional.of("HIT"));
+    for (HttpResponse<String> answer : List.of(first, second)) {
+      assertThat(answer.headers().firstValue("x-cache-status")).isNotEqualTo(Optional.of("HIT"));
+    }
     assertThat(first.body()).isEqualTo(second.body());
     assertThat(count("GET /v1/holds/{holdId}", "200")).isEqualTo(before + 2);
   }
@@ -109,17 +122,20 @@ class StackInvariantTest {
     assertThat(overSeatWaveLimit.body()).contains("The body is over 1,024 bytes");
   }
 
-  private static HttpResponse<String> hold(String seatLabel)
+  private static HttpResponse<String> hold(String section)
       throws IOException, InterruptedException {
-    String body = "{\"eventId\":1,\"seat\":\"" + seatLabel + "\",\"customer\":\"stack-test\"}";
-    return client.send(
-        HttpRequest.newBuilder(URI.create(PROXY + "/v1/holds"))
-            .timeout(TIMEOUT)
-            .header("Content-Type", "application/json")
-            .header("Idempotency-Key", "\"" + UUID.randomUUID() + "\"")
-            .POST(HttpRequest.BodyPublishers.ofString(body))
-            .build(),
-        HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+    // Holds last 300 s and the stack may still hold seats from an earlier run, so a taken seat
+    // (409) moves on to the next number instead of failing the test; the seats of one run never
+    // repeat, because the counter only grows.
+    HttpResponse<String> answer = null;
+    for (int attempt = 0; attempt < MAX_SEAT_ATTEMPTS; attempt++) {
+      String seat = section + "-" + (1 + NEXT_SEAT.getAndIncrement() % SEATS_PER_SECTION);
+      answer = post("{\"eventId\":1,\"seat\":\"" + seat + "\",\"customer\":\"stack-test\"}");
+      if (answer.statusCode() != CONFLICT) {
+        return answer;
+      }
+    }
+    return answer;
   }
 
   private static HttpResponse<String> post(String body) throws IOException, InterruptedException {
@@ -153,10 +169,5 @@ class StackInvariantTest {
                     + "\"} (\\d+)")
             .matcher(metrics);
     return matcher.find() ? Long.parseLong(matcher.group(1)) : 0;
-  }
-
-  private static int seat() {
-    // A seat number from 1 to 1000 that this run has not used, so every hold succeeds.
-    return 1 + (int) (Math.abs(UUID.randomUUID().getLeastSignificantBits()) % 1_000);
   }
 }

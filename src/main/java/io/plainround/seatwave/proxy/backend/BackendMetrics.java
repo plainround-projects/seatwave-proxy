@@ -59,10 +59,6 @@ final class BackendMetrics {
     rejectedByQueue.increment();
   }
 
-  int busyWorkers() {
-    return busyWorkers.get();
-  }
-
   String render() {
     StringBuilder text = new StringBuilder();
     text.append("# TYPE seatwave_requests_total counter\n");
@@ -73,7 +69,7 @@ final class BackendMetrics {
       text.append(
           String.format(
               Locale.ROOT,
-              "seatwave_requests_total{route=\"%s\",status=\"%s\"} %d%n",
+              "seatwave_requests_total{route=\"%s\",status=\"%s\"} %d\n",
               key.substring(0, bar),
               key.substring(bar + 1),
               count));
@@ -85,7 +81,7 @@ final class BackendMetrics {
         .append(
             String.format(
                 Locale.ROOT,
-                "seatwave_worker_busy_seconds_total %.6f%n",
+                "seatwave_worker_busy_seconds_total %.6f\n",
                 busyNanos.sum() / NANOS_PER_SECOND));
     line(text, "counter", "seatwave_response_bytes_total", responseBytes.sum());
     line(text, "counter", "seatwave_forwarding_headers_ignored_total", forwardingIgnored.sum());

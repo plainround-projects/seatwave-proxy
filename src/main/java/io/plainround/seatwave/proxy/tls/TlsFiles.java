@@ -38,7 +38,20 @@ public final class TlsFiles {
     char[] password = password(passwordFile);
     try (InputStream in = open(keystore)) {
       KeyStore store = KeyStore.getInstance("PKCS12");
-      store.load(in, password);
+      try {
+        store.load(in, password);
+      } catch (IOException wrongPassword) {
+        // KeyStore.load reports a wrong password as an IOException with the JDK's own wording; the
+        // message names both files, so a reader knows which pair does not match.
+        throw new IOException(
+            "the keystore "
+                + keystore
+                + " cannot be opened with the password in "
+                + passwordFile
+                + ": "
+                + wrongPassword.getMessage(),
+            wrongPassword);
+      }
       KeyManagerFactory keys =
           KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
       keys.init(store, password);

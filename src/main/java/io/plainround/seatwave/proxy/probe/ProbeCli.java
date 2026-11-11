@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import javax.net.ssl.SSLException;
 
 /**
  * Command-line entry point of the probe: one client sends a request at a fixed interval and records
@@ -58,7 +59,20 @@ public final class ProbeCli {
     if (loaded.isEmpty()) {
       return EXIT_BAD_USAGE;
     }
-    ProbeSettings settings = loaded.get();
+    return probeAndPrint(loaded.get(), out, err);
+  }
+
+  /**
+   * Runs the probe with checked settings and prints the timeline.
+   *
+   * @param settings the checked settings
+   * @param out where the timeline is printed
+   * @param err where problems are printed
+   * @return 0, or 2 if the certificate authority file cannot be used
+   * @throws InterruptedException if the thread is interrupted while waiting
+   */
+  static int probeAndPrint(ProbeSettings settings, PrintStream out, PrintStream err)
+      throws InterruptedException {
     HttpClient client;
     try {
       client =
@@ -77,10 +91,10 @@ public final class ProbeCli {
     }
     out.printf(
         Locale.ROOT,
-        "probe: GET %s every %d ms for %d s, one client, HTTP/1.1 keep-alive%n",
+        "probe: GET %s every %d ms for %s, one client, HTTP/1.1 keep-alive%n",
         settings.uri(),
         settings.interval().toMillis(),
-        settings.duration().toSeconds());
+        wholeSecondsOrMillis(settings.duration()));
     out.print(Timeline.render(outcomes));
     return 0;
   }
@@ -118,16 +132,30 @@ public final class ProbeCli {
     return outcomes;
   }
 
+  private static String wholeSecondsOrMillis(Duration duration) {
+    // "for 30 s" as before for whole seconds, and "for 500 ms" instead of "for 0 s" otherwise.
+    return duration.toMillisPart() == 0 ? duration.toSeconds() + " s" : duration.toMillis() + " ms";
+  }
+
   private static String send(HttpClient client, HttpRequest request) throws InterruptedException {
     try {
       return Integer.toString(
           client.send(request, HttpResponse.BodyHandlers.discarding()).statusCode());
     } catch (HttpConnectTimeoutException slowConnect) {
-      return "connect timeout";
+      // HttpClient's connect timeout covers the TLS handshake too, so over https the two cannot be
+      // told apart, and the label says so.
+      return request.uri().getScheme().equals("https")
+          ? "connect or TLS timeout"
+          : "connect timeout";
     } catch (HttpTimeoutException slowAnswer) {
       return "request timeout";
     } catch (ConnectException refused) {
       return "connection refused";
+    } catch (SSLException tlsFailed) {
+      // The server answered, but not in TLS this client accepts: plain HTTP on the port, a
+      // certificate the TEST CA did not sign, or a refused handshake. The JDK client raises this
+      // type only for TLS's own errors; a broken connection is an ordinary IOException.
+      return "TLS failed";
     } catch (IOException broken) {
       // Any other failure: the connection closed or reset under the request.
       return "connection lost";

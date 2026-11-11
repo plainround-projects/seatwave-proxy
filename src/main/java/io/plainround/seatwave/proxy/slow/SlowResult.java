@@ -8,7 +8,7 @@ import java.util.Objects;
  *
  * @param completed slow clients that read a whole 200 response
  * @param failed slow clients that got anything else, or gave up
- * @param bodyBytes the bytes one complete download read, headers included
+ * @param responseBytes the bytes one complete download read, its head and its body
  * @param downloadP50 the median time a slow client needed for its download
  * @param downloadMax the longest download
  * @param workersBusyMax the most SeatWave workers busy at one reading
@@ -24,7 +24,7 @@ import java.util.Objects;
 public record SlowResult(
     int completed,
     int failed,
-    long bodyBytes,
+    long responseBytes,
     Duration downloadP50,
     Duration downloadMax,
     int workersBusyMax,

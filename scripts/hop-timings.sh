@@ -20,7 +20,8 @@ readonly PROXY_URL="http://127.0.0.1:8080/events/1/seats?section=A"
 [[ $# -ge 2 ]] || { echo "usage: $0 <runs> <output file> [--run]" >&2; exit 2; }
 runs="$1"
 out_file="$2"
-[[ "$runs" =~ ^[0-9]+$ ]] && (( runs >= 1 && runs <= MAX_RUNS )) \
+# No leading zero: bash would read "08" as a broken octal number and "010" as 8.
+[[ "$runs" =~ ^[1-9][0-9]*$ ]] && (( runs <= MAX_RUNS )) \
   || { echo "runs must be 1 to $MAX_RUNS" >&2; exit 2; }
 [[ ! -e "$out_file" ]] || { echo "refusing to overwrite $out_file" >&2; exit 2; }
 format='%s dns=%%{time_namelookup} connect=%%{time_connect} tls=%%{time_appconnect} ttfb=%%{time_starttransfer} total=%%{time_total} http=%%{http_version} code=%%{http_code} size=%%{size_download} connects=%%{num_connects} server=%%header{server-timing}\\n'

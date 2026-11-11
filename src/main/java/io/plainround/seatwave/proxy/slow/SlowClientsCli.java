@@ -54,8 +54,22 @@ public final class SlowClientsCli {
     if (loaded.isEmpty()) {
       return EXIT_BAD_USAGE;
     }
+    return runAndPrint(loaded.get(), out, err);
+  }
+
+  /**
+   * Runs the slow clients with checked settings and prints what they measured.
+   *
+   * @param settings the checked settings
+   * @param out where the results are printed
+   * @param err where problems are printed
+   * @return 0, or 1 if SeatWave's metrics could not be read
+   * @throws InterruptedException if the thread is interrupted while waiting
+   */
+  static int runAndPrint(SlowSettings settings, PrintStream out, PrintStream err)
+      throws InterruptedException {
     try {
-      print(loaded.get(), SlowClients.run(loaded.get()), out);
+      print(settings, SlowClients.run(settings), out);
       return 0;
     } catch (IOException failed) {
       err.println("the run stopped: " + failed.getMessage());
@@ -80,7 +94,7 @@ public final class SlowClientsCli {
             + " max %.2f s%n",
         result.completed(),
         result.failed(),
-        result.bodyBytes(),
+        result.responseBytes(),
         seconds(result.downloadP50()),
         seconds(result.downloadMax()));
     out.printf(

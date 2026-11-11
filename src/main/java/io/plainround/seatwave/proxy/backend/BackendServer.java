@@ -59,6 +59,8 @@ public final class BackendServer implements AutoCloseable {
   private static final long SHUTDOWN_WAIT_SECONDS = 5;
   // sendResponseHeaders takes 0 for "length unknown", which makes the JDK server send chunks.
   private static final long CHUNKED = 0;
+  // ... and -1 for "no body at all", the answer to a HEAD request.
+  private static final long NO_BODY = -1;
   private static final int STREAM_OK = 200;
   private static final int ADMIN_OK = 200;
   private static final int ADMIN_NOT_FOUND = 404;
@@ -81,7 +83,8 @@ public final class BackendServer implements AutoCloseable {
     this.settings = settings;
     this.metrics = new BackendMetrics(settings.workerThreads());
     this.routes =
-        new SeatWaveRoutes(new HoldLedger(clock), metrics, settings.timing(), new JsonCodec());
+        new SeatWaveRoutes(
+            new HoldLedger(clock), new HoldKeys(), settings.timing(), new JsonCodec());
     AtomicInteger workerNumber = new AtomicInteger();
     this.workers =
         new ThreadPoolExecutor(
@@ -163,7 +166,10 @@ public final class BackendServer implements AutoCloseable {
     return admin.getAddress().getPort();
   }
 
-  /** Stops the listeners and the workers, waiting a few seconds for running requests. */
+  /**
+   * Stops the listeners, interrupts the requests that are still running (a long poll or an event
+   * stream ends at once) and waits up to 5 seconds for the workers to finish.
+   */
   @Override
   public void close() {
     plain.stop(STOP_DELAY_SECONDS);
@@ -188,14 +194,12 @@ public final class BackendServer implements AutoCloseable {
     long bytes = 0;
     try (exchange) {
       Request request = request(exchange, scheme);
-      MDC.put("correlationId", request.correlationId());
       SeatWaveRoutes.Routed routed = routes.route(request);
       route = routed.route();
       switch (routed.reply()) {
         case Reply.Body body -> {
           status = body.status();
-          bytes = body.length();
-          writeBody(exchange, body, startNanos);
+          bytes = writeBody(exchange, body, startNanos);
         }
         case Reply.EventStream stream -> {
           status = STREAM_OK;
@@ -255,10 +259,6 @@ public final class BackendServer implements AutoCloseable {
       // The forged-header case of the invariant: counted, and the headers are not used.
       metrics.forwardingIgnored();
     }
-    if (client.source() == AddressSource.UNREADABLE) {
-      metrics.forwardingUnreadable();
-      LOG.warn("a trusted proxy sent forwarding headers that cannot be read; using its address");
-    }
     List<String> requestIds = headers.getOrDefault("x-request-id", List.of());
     String correlationId =
         isTrustedPeer
@@ -266,6 +266,12 @@ public final class BackendServer implements AutoCloseable {
                 && REQUEST_ID.matcher(requestIds.getFirst()).matches()
             ? requestIds.getFirst()
             : UUID.randomUUID().toString().replace("-", "");
+    // Set before the first log line of the request, so every line carries the correlation id.
+    MDC.put("correlationId", correlationId);
+    if (client.source() == AddressSource.UNREADABLE) {
+      metrics.forwardingUnreadable();
+      LOG.warn("a trusted proxy sent forwarding headers that cannot be read; using its address");
+    }
     byte[] body;
     boolean tooLarge;
     try (InputStream in = exchange.getRequestBody()) {
@@ -286,7 +292,7 @@ public final class BackendServer implements AutoCloseable {
         correlationId);
   }
 
-  private static void writeBody(HttpExchange exchange, Reply.Body body, long startNanos)
+  private static long writeBody(HttpExchange exchange, Reply.Body body, long startNanos)
       throws IOException {
     exchange.getResponseHeaders().set("Content-Type", body.contentType());
     body.headers()
@@ -296,12 +302,19 @@ public final class BackendServer implements AutoCloseable {
     exchange
         .getResponseHeaders()
         .set("Server-Timing", String.format(Locale.ROOT, "app;dur=%.2f", serverMillis));
+    if (isHead(exchange)) {
+      // The same headers as the GET, the length the GET would send, and no body.
+      exchange.getResponseHeaders().set("Content-Length", Integer.toString(body.length()));
+      exchange.sendResponseHeaders(body.status(), NO_BODY);
+      return 0;
+    }
     exchange.sendResponseHeaders(body.status(), body.length());
     try (OutputStream out = exchange.getResponseBody()) {
       // This write is what a slow client stretches: it returns only when the kernel has taken
       // every byte, so the worker stays busy until then.
       out.write(body.body());
     }
+    return body.length();
   }
 
   private static long writeStream(HttpExchange exchange, Reply.EventStream stream)
@@ -310,6 +323,10 @@ public final class BackendServer implements AutoCloseable {
     stream
         .headers()
         .forEach(header -> exchange.getResponseHeaders().add(header.getKey(), header.getValue()));
+    if (isHead(exchange)) {
+      exchange.sendResponseHeaders(STREAM_OK, NO_BODY);
+      return 0;
+    }
     exchange.sendResponseHeaders(STREAM_OK, CHUNKED);
     long written = 0;
     long endNanos = System.nanoTime() + stream.lifetime().toNanos();
@@ -330,6 +347,10 @@ public final class BackendServer implements AutoCloseable {
       Thread.currentThread().interrupt();
     }
     return written;
+  }
+
+  private static boolean isHead(HttpExchange exchange) {
+    return exchange.getRequestMethod().equals("HEAD");
   }
 
   private static HttpsConfigurator tlsOnlyVersion13(SSLContext context) {

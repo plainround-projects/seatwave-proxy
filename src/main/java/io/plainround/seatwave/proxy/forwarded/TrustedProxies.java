@@ -5,6 +5,7 @@ import java.net.InetAddress;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -40,12 +41,13 @@ public record TrustedProxies(Set<InetAddress> addresses) {
     Objects.requireNonNull(literals, "literals");
     Set<InetAddress> parsed = new LinkedHashSet<>();
     for (String literal : literals) {
-      try {
-        // ofLiteral never consults DNS: a name here is refused, not resolved.
-        parsed.add(InetAddress.ofLiteral(literal));
-      } catch (IllegalArgumentException notAnAddress) {
+      // The same strict rule as the forwarded hops: never a name, never DNS, and no short IPv4
+      // form that would trust another address than the one written.
+      Optional<InetAddress> address = ClientAddress.literal(literal);
+      if (address.isEmpty()) {
         return Result.error("a trusted proxy must be an IP address, but was '" + literal + "'");
       }
+      parsed.add(address.get());
     }
     if (parsed.isEmpty()) {
       return Result.error("at least one trusted proxy address is needed");

@@ -2,7 +2,12 @@ package io.plainround.seatwave.proxy.backend;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
 
 class HoldKeysTest {
@@ -45,6 +50,38 @@ class HoldKeysTest {
 
     assertThat(overflow).isInstanceOf(HoldKeys.Claim.Full.class);
     assertThat(existing).isInstanceOf(HoldKeys.Claim.InProgress.class);
-    assertThat(List.of(overflow, existing)).doesNotHaveDuplicates();
+  }
+
+  @Test
+  void givesOneOfManyRacingClaimsOfOneKeyTheWorkAndKeepsTheLosersOutOfTheCount() throws Exception {
+    HoldKeys keys = new HoldKeys();
+    int racers = 100;
+    CountDownLatch start = new CountDownLatch(1);
+    List<Future<HoldKeys.Claim>> claims = new ArrayList<>();
+    try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+      for (int racer = 0; racer < racers; racer++) {
+        claims.add(
+            pool.submit(() -> {
+              start.await();
+              return keys.claim("\"raced\"", "fingerprint");
+            }));
+      }
+      start.countDown();
+      List<HoldKeys.Claim> outcomes = new ArrayList<>();
+      for (Future<HoldKeys.Claim> claim : claims) {
+        outcomes.add(claim.get());
+      }
+
+      assertThat(outcomes).filteredOn(HoldKeys.Claim.Owner.class::isInstance).hasSize(1);
+      assertThat(outcomes)
+          .filteredOn(HoldKeys.Claim.InProgress.class::isInstance)
+          .hasSize(racers - 1);
+    }
+    // The race took one place in the table. A loser that kept a place would make it full early.
+    for (int keyIndex = 1; keyIndex < HoldKeys.MAX_KEYS; keyIndex++) {
+      assertThat(keys.claim("\"k" + keyIndex + "\"", "fingerprint"))
+          .isInstanceOf(HoldKeys.Claim.Owner.class);
+    }
+    assertThat(keys.claim("\"over\"", "fingerprint")).isInstanceOf(HoldKeys.Claim.Full.class);
   }
 }

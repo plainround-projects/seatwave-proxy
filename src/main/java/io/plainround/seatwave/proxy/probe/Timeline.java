@@ -84,16 +84,28 @@ public final class Timeline {
               millis(span.medianLatency()),
               millis(span.maxLatency())));
     }
-    text.append(
-        outage(outcomes)
-            .map(duration ->
-                String.format(
-                    Locale.ROOT,
-                    "outage: %.3f s from the first failed request to the first success after"
-                        + " the last%n",
-                    seconds(duration)))
-            .orElse("outage: none that ended inside the probe" + System.lineSeparator()));
+    text.append(outageLine(outcomes)).append(System.lineSeparator());
     return text.toString();
+  }
+
+  private static String outageLine(List<Outcome> outcomes) {
+    Optional<Duration> outage = outage(outcomes);
+    if (outage.isPresent()) {
+      return String.format(
+          Locale.ROOT,
+          "outage: %.3f s from the first failed request to the first success after the last",
+          seconds(outage.get()));
+    }
+    // No ended outage has two causes, and the reader must be told which one it was.
+    Optional<Outcome> firstFailure =
+        outcomes.stream().filter(each -> !each.isSuccess()).findFirst();
+    return firstFailure
+        .map(failure ->
+            String.format(
+                Locale.ROOT,
+                "outage: from %.3f s to the end of the probe, with no success after it",
+                seconds(failure.sentAt())))
+        .orElse("outage: none, every request succeeded");
   }
 
   private static double seconds(Duration duration) {
